@@ -1,0 +1,52 @@
+{
+  "name": "uniquemutexmanager",
+  "version": "0.1.0",
+  "description": "Unique mutex manager with optional Redis-backed distributed locking",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [],
+  "author": "swittk",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/swittk/uniquemutexmanager"
+  },
+  "bugs": "https://github.com/swittk/uniquemutexmanager/issues",
+  "license": "WTFPL",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^24.9.2",
+    "ioredis": "^5.8.2",
+    "redlock": "^5.0.0-beta.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.4"
+  },
+  "peerDependencies": {
+    "ioredis": "^5.0.0",
+    "redlock": "^5.0.0-beta.2"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "redlock": {
+      "optional": true
+    }
+  },
+  "types": "dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "default": "./dist/esm/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ]
+}
