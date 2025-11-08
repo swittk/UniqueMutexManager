@@ -8,8 +8,10 @@ if (!fs.existsSync(esmDir)) {
   throw new Error(`Expected ESM output directory at ${esmDir} to exist. Did the TypeScript build succeed?`);
 }
 
-const esmPackageJson = {
-  type: 'module'
-};
+const existingPackageJson = fs.existsSync(esmPackageJsonPath)
+  ? JSON.parse(fs.readFileSync(esmPackageJsonPath, 'utf8'))
+  : {};
 
-fs.writeFileSync(esmPackageJsonPath, JSON.stringify(esmPackageJson, null, 2) + '\n');
+if (existingPackageJson.type !== 'module') {
+  fs.writeFileSync(esmPackageJsonPath, JSON.stringify({ type: 'module' }, null, 2) + '\n');
+}
