@@ -193,6 +193,37 @@ describe('UniqueMutexManager (single process)', () => {
     expect(completionOrder).toEqual([0, 1, 2, 3, 4]);
   });
 
+  it('preserves execution order when waiting metadata updates are delayed', async () => {
+    const manager = new UniqueMutexManager();
+    const managerWithHooks = manager as unknown as {
+      updateWaitingState: (context: unknown, waitingFor?: string) => Promise<void> | void;
+    };
+    const originalUpdate = managerWithHooks.updateWaitingState.bind(manager);
+    managerWithHooks.updateWaitingState = async function (context: unknown, waitingFor?: string) {
+      await sleep(10);
+      return originalUpdate(context, waitingFor);
+    };
+
+    const startOrder: number[] = [];
+
+    try {
+      const first = manager.runOperation('shared', async () => {
+        startOrder.push(1);
+        await sleep(5);
+      });
+
+      const second = manager.runOperation('shared', async () => {
+        startOrder.push(2);
+      });
+
+      await Promise.all([first, second]);
+    } finally {
+      managerWithHooks.updateWaitingState = originalUpdate;
+    }
+
+    expect(startOrder).toEqual([1, 2]);
+  });
+
   it('supports high concurrency without overlapping execution', async () => {
     const manager = new UniqueMutexManager();
     const operations = 40;

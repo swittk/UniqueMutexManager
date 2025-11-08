@@ -590,131 +590,160 @@ export class UniqueMutexManager {
         throw new MutexLockedError(id);
       }
 
-      let waitingMarked = false;
-      let waitingUpdate: Promise<void> | void;
-      if (canWait) {
-        waitingMarked = true;
-        waitingUpdate = this.updateWaitingState(context, id);
-        if (waitingUpdate) {
-          await waitingUpdate;
-        }
-      }
-
-      const deadlockCycle = canWait
-        ? this.coordinationClient
-          ? await this.detectRemoteDeadlock(context, id)
-          : this.detectLocalDeadlock(context, id)
-        : undefined;
-      if (deadlockCycle) {
-        const reset = waitingMarked ? this.updateWaitingState(context, undefined) : undefined;
-        if (reset) {
-          await reset;
-        }
-        throw new MutexDeadlockError(id, deadlockCycle);
-      }
-
       lockState.pending += 1;
 
-      const runPromise = lockState.tail.then(async () => {
-        let distributedLock: DistributedLockHandle | undefined;
-        let waitingCleared = !waitingMarked;
-        let operationStarted = false;
+      const previousTail = lockState.tail;
+      let resolveReady: (() => void) | undefined;
+      let rejectReady: ((error: unknown) => void) | undefined;
+      const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      ready.catch(() => undefined);
 
-        try {
-          if (timeoutError && timedOut) {
-            throw timeoutError;
-          }
+      let runActual: (() => Promise<T>) | undefined;
 
-          if (aborted || abortSignal.aborted) {
-            markAborted();
-            throw new MutexAbortedError(id, abortSignal.reason);
-          }
-
-          try {
-            distributedLock = await this.acquireDistributedLock(id, canWait);
-          } catch (error) {
-            if (timeoutError && error instanceof MutexLockedError) {
-              throw timeoutError;
-            }
-            throw error;
-          }
-
-          if (timeoutError && timedOut) {
-            if (distributedLock) {
-              await distributedLock.release().catch(() => undefined);
-            }
-            throw timeoutError;
-          }
-
-          if (aborted || abortSignal.aborted) {
-            markAborted();
-            if (distributedLock) {
-              await distributedLock.release().catch(() => undefined);
-            }
-            throw new MutexAbortedError(id, abortSignal.reason);
-          }
-
-        if (waitingMarked) {
-          const cleared = this.updateWaitingState(context, undefined);
-          if (cleared) {
-            await cleared;
-          }
-          waitingCleared = true;
-        }
-
-        clearTimer();
-        operationStarted = true;
-
-        const count = this.incrementHeldLock(context, id, distributedLock);
-        if (count === 1) {
-          await this.setRemoteOwner(id, context);
-        }
-
-        const startTime = Date.now();
-        const result = await operation({
-          requestTime,
-          startTime,
-          currentMutex: mutex,
-          heldMutexIds: this.getHeldMutexIds(context),
-          contextToken,
-          abortSignal,
-        });
-        if (aborted || abortSignal.aborted) {
-          markAborted();
-          throw new MutexAbortedError(id, abortSignal.reason);
-        }
-        return result;
-      } finally {
-        if ((!waitingCleared || context.waitingFor === id) && waitingMarked) {
-          const reset = this.updateWaitingState(context, undefined);
-          if (reset) {
-            await reset;
-          }
-        }
-
-        // Only release locks if the operation actually started
-        if (operationStarted) {
-          const releaseResult = this.decrementHeldLock(context, id);
-          if (releaseResult.removed) {
-            await this.clearRemoteOwner(id, context.id);
-          }
-          if (releaseResult.handle) {
-            await releaseResult.handle.release().catch(() => undefined);
-          } else if (distributedLock && releaseResult.removed) {
-            await distributedLock.release().catch(() => undefined);
-          }
-        }
-
-        lockState.pending -= 1;
-        if (lockState.pending === 0) {
-          this.locks.delete(id);
-        }
-      }
-    });
+      const runPromise = previousTail.then(async () => {
+        await ready;
+        return runActual!();
+      });
 
       lockState.tail = runPromise
         .then(() => undefined)
         .catch(() => undefined);
+
+      let waitingMarked = false;
+      try {
+        if (canWait) {
+          waitingMarked = true;
+          const waitingUpdate = this.updateWaitingState(context, id);
+          if (waitingUpdate) {
+            await waitingUpdate;
+          }
+        }
+
+        const deadlockCycle = canWait
+          ? this.coordinationClient
+            ? await this.detectRemoteDeadlock(context, id)
+            : this.detectLocalDeadlock(context, id)
+          : undefined;
+        if (deadlockCycle) {
+          const reset = waitingMarked ? this.updateWaitingState(context, undefined) : undefined;
+          if (reset) {
+            await reset;
+          }
+          throw new MutexDeadlockError(id, deadlockCycle);
+        }
+
+        runActual = async () => {
+          let distributedLock: DistributedLockHandle | undefined;
+          let waitingCleared = !waitingMarked;
+          let operationStarted = false;
+
+          try {
+            if (timeoutError && timedOut) {
+              throw timeoutError;
+            }
+
+            if (aborted || abortSignal.aborted) {
+              markAborted();
+              throw new MutexAbortedError(id, abortSignal.reason);
+            }
+
+            try {
+              distributedLock = await this.acquireDistributedLock(id, canWait);
+            } catch (error) {
+              if (timeoutError && error instanceof MutexLockedError) {
+                throw timeoutError;
+              }
+              throw error;
+            }
+
+            if (timeoutError && timedOut) {
+              if (distributedLock) {
+                await distributedLock.release().catch(() => undefined);
+              }
+              throw timeoutError;
+            }
+
+            if (aborted || abortSignal.aborted) {
+              markAborted();
+              if (distributedLock) {
+                await distributedLock.release().catch(() => undefined);
+              }
+              throw new MutexAbortedError(id, abortSignal.reason);
+            }
+
+            if (waitingMarked) {
+              const cleared = this.updateWaitingState(context, undefined);
+              if (cleared) {
+                await cleared;
+              }
+              waitingCleared = true;
+            }
+
+            clearTimer();
+            operationStarted = true;
+
+            const count = this.incrementHeldLock(context, id, distributedLock);
+            if (count === 1) {
+              await this.setRemoteOwner(id, context);
+            }
+
+            const startTime = Date.now();
+            const result = await operation({
+              requestTime,
+              startTime,
+              currentMutex: mutex,
+              heldMutexIds: this.getHeldMutexIds(context),
+              contextToken,
+              abortSignal,
+            });
+            if (aborted || abortSignal.aborted) {
+              markAborted();
+              throw new MutexAbortedError(id, abortSignal.reason);
+            }
+            return result;
+          } finally {
+            if ((!waitingCleared || context.waitingFor === id) && waitingMarked) {
+              const reset = this.updateWaitingState(context, undefined);
+              if (reset) {
+                await reset;
+              }
+            }
+
+            if (operationStarted) {
+              const releaseResult = this.decrementHeldLock(context, id);
+              if (releaseResult.removed) {
+                await this.clearRemoteOwner(id, context.id);
+              }
+              if (releaseResult.handle) {
+                await releaseResult.handle.release().catch(() => undefined);
+              } else if (distributedLock && releaseResult.removed) {
+                await distributedLock.release().catch(() => undefined);
+              }
+            }
+
+            lockState.pending -= 1;
+            if (lockState.pending === 0) {
+              this.locks.delete(id);
+            }
+          }
+        };
+
+        resolveReady?.();
+        resolveReady = undefined;
+        rejectReady = undefined;
+      } catch (error) {
+        lockState.pending -= 1;
+        if (lockState.pending === 0) {
+          this.locks.delete(id);
+        }
+        rejectReady?.(error);
+        resolveReady = undefined;
+        rejectReady = undefined;
+        throw error;
+      }
 
       const hasTimeoutWrapper = Boolean(timeoutError && canWait && timeoutMs !== undefined && timeoutMs > 0);
       const needsWrapper = hasTimeoutWrapper || abortable;
