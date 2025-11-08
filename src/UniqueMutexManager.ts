@@ -618,6 +618,7 @@ export class UniqueMutexManager {
       const runPromise = lockState.tail.then(async () => {
         let distributedLock: DistributedLockHandle | undefined;
         let waitingCleared = !waitingMarked;
+        let operationStarted = false;
 
         try {
           if (timeoutError && timedOut) {
@@ -662,6 +663,7 @@ export class UniqueMutexManager {
         }
 
         clearTimer();
+        operationStarted = true;
 
         const count = this.incrementHeldLock(context, id, distributedLock);
         if (count === 1) {
@@ -690,14 +692,17 @@ export class UniqueMutexManager {
           }
         }
 
-        const releaseResult = this.decrementHeldLock(context, id);
-        if (releaseResult.removed) {
-          await this.clearRemoteOwner(id, context.id);
-        }
-        if (releaseResult.handle) {
-          await releaseResult.handle.release().catch(() => undefined);
-        } else if (distributedLock && releaseResult.removed) {
-          await distributedLock.release().catch(() => undefined);
+        // Only release locks if the operation actually started
+        if (operationStarted) {
+          const releaseResult = this.decrementHeldLock(context, id);
+          if (releaseResult.removed) {
+            await this.clearRemoteOwner(id, context.id);
+          }
+          if (releaseResult.handle) {
+            await releaseResult.handle.release().catch(() => undefined);
+          } else if (distributedLock && releaseResult.removed) {
+            await distributedLock.release().catch(() => undefined);
+          }
         }
 
         lockState.pending -= 1;

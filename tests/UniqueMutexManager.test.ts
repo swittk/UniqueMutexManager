@@ -349,10 +349,11 @@ describe('UniqueMutexManager (single process)', () => {
     const reason = new Error('cancel-waiting');
     controller.abort(reason);
 
-    const error = await queued.catch((err) => err as MutexAbortedError);
+    const error = await queued.catch((err) => err);
     expect(error).toBeInstanceOf(MutexAbortedError);
-    expect(error.id).toBe('abort');
-    expect(error.reason).toBe(reason);
+    const abortedError = error as MutexAbortedError;
+    expect(abortedError.id).toBe('abort');
+    expect(abortedError.reason).toBe(reason);
     expect(executed).toBe(false);
 
     releaseBlocker();
@@ -399,10 +400,11 @@ describe('UniqueMutexManager (single process)', () => {
     const reason = { tag: 'external-abort' };
     abortFn?.(reason);
 
-    const error = await queued.catch((err) => err as MutexAbortedError);
+    const error = await queued.catch((err) => err);
     expect(error).toBeInstanceOf(MutexAbortedError);
-    expect(error.id).toBe('abort-hook');
-    expect(error.reason).toBe(reason);
+    const abortedError = error as MutexAbortedError;
+    expect(abortedError.id).toBe('abort-hook');
+    expect(abortedError.reason).toBe(reason);
     expect(executed).toBe(false);
 
     releaseBlocker();
@@ -433,10 +435,11 @@ describe('UniqueMutexManager (single process)', () => {
     await sleep(30);
     controller.abort('stop-now');
 
-    const error = await runner.catch((err) => err as MutexAbortedError);
+    const error = await runner.catch((err) => err);
     expect(error).toBeInstanceOf(MutexAbortedError);
-    expect(error.id).toBe('cooperative');
-    expect(error.reason).toBe('stop-now');
+    const abortedError = error as MutexAbortedError;
+    expect(abortedError.id).toBe('cooperative');
+    expect(abortedError.reason).toBe('stop-now');
     expect(abortEvents).toBeGreaterThanOrEqual(1);
   });
 
@@ -1028,6 +1031,780 @@ describe('UniqueMutexManager (single process)', () => {
       expect(order).toEqual([...Array(operationsPerKey).keys()]);
     }
   });
+
+  it('prevents overlapping execution with staggered micro-delays', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: number[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+
+    const tasks = Array.from({ length: 50 }, async (_, i) => {
+      // Staggered delays from 0-5ms to create race conditions
+      await sleep(randomInt(0, 5));
+      return manager.runOperation('micro-race', async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        expect(concurrent).toBe(1);
+        executions.push(i);
+        await sleep(randomInt(1, 3));
+        concurrent--;
+        return i;
+      });
+    });
+
+    await Promise.all(tasks);
+    expect(maxConcurrent).toBe(1);
+    expect(executions).toHaveLength(50);
+  });
+
+  it('handles timeout expiration during lock handover', async () => {
+    const manager = new UniqueMutexManager();
+
+    let blockerResolved = false;
+    const blocker = manager.runOperation('timeout-race', async () => {
+      await sleep(30);
+      blockerResolved = true;
+      return 'blocker';
+    });
+
+    // Wait a bit then start timeout operation
+    await sleep(10);
+
+    const start = Date.now();
+    await expect(
+      manager.runOperation('timeout-race', async () => 'should-timeout', { timeoutMs: 15 })
+    ).rejects.toBeInstanceOf(MutexTimeoutError);
+
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(10);
+    expect(elapsed).toBeLessThan(50);
+
+    await blocker;
+    expect(blockerResolved).toBe(true);
+  });
+
+  it('prevents race conditions with rapid abort during lock acquisition', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: string[] = [];
+    let concurrent = 0;
+
+    const slowBlocker = manager.runOperation('abort-race', async () => {
+      executions.push('start-blocker');
+      concurrent++;
+      expect(concurrent).toBe(1);
+      await sleep(50);
+      concurrent--;
+      executions.push('end-blocker');
+      return 'blocker';
+    });
+
+    await sleep(5);
+
+    const tasks: Promise<string>[] = [];
+    for (let i = 0; i < 20; i++) {
+      const controller = new AbortController();
+      const task = manager.runOperation('abort-race', async () => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executions.push(`start-${i}`);
+        await sleep(5);
+        concurrent--;
+        executions.push(`end-${i}`);
+        return `task-${i}`;
+      }, { signal: controller.signal });
+
+      // Abort some operations at random times during lock acquisition
+      if (i % 3 === 0) {
+        setTimeout(() => controller.abort(`abort-${i}`), randomInt(1, 10));
+      }
+
+      tasks.push(task.catch(err => {
+        if (err instanceof MutexAbortedError) {
+          return `aborted-${i}`;
+        }
+        throw err;
+      }));
+    }
+
+    const results = await Promise.all(tasks);
+    await slowBlocker;
+
+    const abortedCount = results.filter(r => r.startsWith('aborted-')).length;
+    expect(abortedCount).toBeGreaterThan(0);
+    expect(concurrent).toBe(0);
+  });
+
+  it('maintains reentrant lock integrity with competing contexts', async () => {
+    const manager = new UniqueMutexManager();
+    const contextA = manager.createContext();
+    const contextB = manager.createContext();
+    const executions: string[] = [];
+    let concurrent = 0;
+
+    const tasks = [
+      manager.runOperation('reentrant-race', async ({ heldMutexIds }) => {
+        executions.push('outer-a');
+        concurrent++;
+        expect(concurrent).toBe(1);
+        expect(heldMutexIds).toEqual(['reentrant-race']);
+
+        await manager.runOperation('reentrant-race', async ({ heldMutexIds: inner }) => {
+          executions.push('inner-a');
+          expect(inner).toEqual(['reentrant-race']);
+          await sleep(10);
+        }, { context: contextA });
+
+        concurrent--;
+        return 'a-done';
+      }, { context: contextA }),
+
+      manager.runOperation('reentrant-race', async ({ heldMutexIds }) => {
+        executions.push('outer-b');
+        concurrent++;
+        expect(concurrent).toBe(1);
+        expect(heldMutexIds).toEqual(['reentrant-race']);
+
+        await manager.runOperation('reentrant-race', async ({ heldMutexIds: inner }) => {
+          executions.push('inner-b');
+          expect(inner).toEqual(['reentrant-race']);
+          await sleep(10);
+        }, { context: contextB });
+
+        concurrent--;
+        return 'b-done';
+      }, { context: contextB }),
+    ];
+
+    await Promise.all(tasks);
+    expect(concurrent).toBe(0);
+    expect(executions).toContain('outer-a');
+    expect(executions).toContain('inner-a');
+    expect(executions).toContain('outer-b');
+    expect(executions).toContain('inner-b');
+  });
+
+  it('handles burst operations with mixed waitIfLocked settings', async () => {
+    const manager = new UniqueMutexManager();
+    const executed: string[] = [];
+    let concurrent = 0;
+
+    const longRunner = manager.runOperation('mixed-wait', async () => {
+      concurrent++;
+      expect(concurrent).toBe(1);
+      executed.push('long-start');
+      await sleep(100);
+      concurrent--;
+      executed.push('long-end');
+      return 'long';
+    });
+
+    await sleep(10);
+
+    const tasks: Promise<string>[] = [];
+    for (let i = 0; i < 30; i++) {
+      const wait = i % 2 === 0; // Alternate waiting and non-waiting
+      const task = manager.runOperation('mixed-wait', async () => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executed.push(`task-${i}`);
+        await sleep(5);
+        concurrent--;
+        return `task-${i}`;
+      }, { waitIfLocked: wait }).catch(err => {
+        if (err instanceof MutexLockedError) {
+          return `locked-${i}`;
+        }
+        throw err;
+      });
+      tasks.push(task);
+    }
+
+    const results = await Promise.all(tasks);
+    await longRunner;
+
+    const locked = results.filter(r => r.startsWith('locked-')).length;
+    const executedTasks = results.filter(r => r.startsWith('task-')).length;
+
+    expect(locked).toBeGreaterThan(0);
+    expect(executedTasks).toBeGreaterThan(0);
+    expect(concurrent).toBe(0);
+  });
+
+  it('prevents overlap with very short timeouts under high contention', async () => {
+    const manager = new UniqueMutexManager();
+    const executed: string[] = [];
+    let concurrent = 0;
+
+    const tasks = Array.from({ length: 100 }, async (_, i) => {
+      await sleep(randomInt(0, 2)); // Minimal staggering
+      return manager.runOperation('short-timeout-stress', async () => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executed.push(`start-${i}`);
+        await sleep(1);
+        concurrent--;
+        return `done-${i}`;
+      }, { timeoutMs: 1 }); // Very short timeout
+    });
+
+    const results = await Promise.allSettled(tasks);
+    const fulfilled = results.filter(r => r.status === 'fulfilled').length;
+    const rejected = results.filter(r => r.status === 'rejected').length;
+
+    expect(rejected).toBeGreaterThan(0); // Some should timeout
+    expect(fulfilled).toBeGreaterThan(0); // Some should succeed
+    expect(concurrent).toBe(0);
+  });
+
+  it('handles timeout vs abort signal precedence', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: string[] = [];
+
+    const blocker = manager.runOperation('timeout-abort-race', async () => {
+      executions.push('blocker-start');
+      await sleep(60);
+      executions.push('blocker-end');
+      return 'blocker';
+    });
+
+    await sleep(10);
+
+    const controller = new AbortController();
+    const start = Date.now();
+
+    // Set abort to happen before timeout
+    setTimeout(() => controller.abort('external-abort'), 25);
+
+    await expect(
+      manager.runOperation('timeout-abort-race', async () => 'should-not-run', {
+        timeoutMs: 50,
+        signal: controller.signal
+      })
+    ).rejects.toBeInstanceOf(MutexAbortedError);
+
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(20);
+    expect(elapsed).toBeLessThan(45); // Aborted before timeout
+
+    await blocker;
+  });
+
+  it('maintains isolation with concurrent operations on different ids', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: Record<string, string[]> = {
+      alpha: [],
+      beta: [],
+      gamma: []
+    };
+    const concurrent: Record<string, number> = {
+      alpha: 0,
+      beta: 0,
+      gamma: 0
+    };
+
+    const ids = ['alpha', 'beta', 'gamma'];
+    const tasks: Promise<string>[] = [];
+
+    for (let i = 0; i < 45; i++) {
+      const id = ids[i % ids.length];
+      const task = manager.runOperation(id, async () => {
+        concurrent[id]++;
+        expect(concurrent[id]).toBe(1);
+        executions[id].push(`task-${i}`);
+        await sleep(randomInt(1, 5));
+        concurrent[id]--;
+        return `done-${i}`;
+      });
+      tasks.push(task);
+    }
+
+    await Promise.all(tasks);
+
+    expect(concurrent.alpha).toBe(0);
+    expect(concurrent.beta).toBe(0);
+    expect(concurrent.gamma).toBe(0);
+
+    expect(executions.alpha.length).toBe(15);
+    expect(executions.beta.length).toBe(15);
+    expect(executions.gamma.length).toBe(15);
+  });
+
+  it('handles high-frequency operations with random delays', async () => {
+    const manager = new UniqueMutexManager();
+    const executed: number[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+
+    const tasks = Array.from({ length: 200 }, async (_, i) => {
+      await sleep(randomInt(0, 10)); // Random delays up to 10ms
+      return manager.runOperation('high-freq-random', async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        expect(concurrent).toBe(1);
+        executed.push(i);
+        await sleep(randomInt(0, 2)); // Very short operations
+        concurrent--;
+        return i;
+      });
+    });
+
+    await Promise.all(tasks);
+    expect(maxConcurrent).toBe(1);
+    expect(executed.length).toBe(200);
+    expect(concurrent).toBe(0);
+  });
+
+  it('survives cascading aborts with multiple abort sources', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: string[] = [];
+
+    const blocker = manager.runOperation('cascading-abort', async () => {
+      executions.push('blocker-start');
+      await sleep(50);
+      executions.push('blocker-end');
+      return 'blocker';
+    });
+
+    await sleep(5);
+
+    const tasks: Promise<string>[] = [];
+    for (let i = 0; i < 15; i++) {
+      const controller1 = new AbortController();
+      const controller2 = new AbortController();
+
+      // Create a combined abort signal
+      const combinedController = new AbortController();
+      const abortHandler = () => combinedController.abort('combined');
+      controller1.signal.addEventListener('abort', abortHandler);
+      controller2.signal.addEventListener('abort', abortHandler);
+
+      const task = manager.runOperation('cascading-abort', async () => {
+        executions.push(`task-${i}-start`);
+        await sleep(5);
+        executions.push(`task-${i}-end`);
+        return `task-${i}`;
+      }, { signal: combinedController.signal }).catch(err => {
+        if (err instanceof MutexAbortedError) {
+          return `aborted-${i}`;
+        }
+        throw err;
+      });
+
+      // Randomly abort using different controllers
+      const abortTime = randomInt(2, 20);
+      setTimeout(() => {
+        if (Math.random() < 0.5) {
+          controller1.abort(`controller1-${i}`);
+        } else {
+          controller2.abort(`controller2-${i}`);
+        }
+      }, abortTime);
+
+      tasks.push(task);
+    }
+
+    const results = await Promise.all(tasks);
+    await blocker;
+
+    const aborted = results.filter(r => r.startsWith('aborted-')).length;
+    expect(aborted).toBeGreaterThan(0);
+    expect(executions).toContain('blocker-start');
+    expect(executions).toContain('blocker-end');
+  });
+
+  it('handles nested timeouts with reentrant operations', async () => {
+    const manager = new UniqueMutexManager();
+    const executions: string[] = [];
+
+    const result = await manager.runOperation('nested-timeout', async () => {
+      executions.push('outer-start');
+
+      // Inner operation with timeout
+      const innerResult = await manager.runOperation('nested-timeout', async () => {
+        executions.push('inner-start');
+        await sleep(20);
+        executions.push('inner-end');
+        return 'inner-done';
+      }, { timeoutMs: 50 });
+
+      executions.push('outer-end');
+      return `outer-done-${innerResult}`;
+    }, { timeoutMs: 100 });
+
+    expect(result).toBe('outer-done-inner-done');
+    expect(executions).toEqual(['outer-start', 'inner-start', 'inner-end', 'outer-end']);
+  });
+
+  it('handles event-driven race conditions with immediate emissions', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+    let concurrentA = 0;
+    let concurrentB = 0;
+
+    const promises: Promise<string>[] = [];
+
+    // Set up event listeners that immediately trigger operations
+    emitter.on('trigger-a', async () => {
+      const promise = manager.runOperation('event-race-a', async () => {
+        concurrentA++;
+        expect(concurrentA).toBe(1);
+        executions.push('a-start');
+        await sleep(randomInt(1, 5));
+        executions.push('a-end');
+        concurrentA--;
+        return 'a-done';
+      });
+      promises.push(promise);
+    });
+
+    emitter.on('trigger-b', async () => {
+      const promise = manager.runOperation('event-race-b', async () => {
+        concurrentB++;
+        expect(concurrentB).toBe(1);
+        executions.push('b-start');
+        await sleep(randomInt(1, 5));
+        executions.push('b-end');
+        concurrentB--;
+        return 'b-done';
+      });
+      promises.push(promise);
+    });
+
+    // Emit events in rapid succession to create race conditions
+    for (let i = 0; i < 20; i++) {
+      emitter.emit('trigger-a');
+      emitter.emit('trigger-b');
+    }
+
+    await Promise.all(promises);
+    expect(concurrentA).toBe(0);
+    expect(concurrentB).toBe(0);
+    expect(executions.filter(e => e.includes('a-')).length).toBe(40);
+    expect(executions.filter(e => e.includes('b-')).length).toBe(40);
+  });
+
+  it('handles nested event triggers creating cascading operations', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+    let concurrent = 0;
+
+    emitter.on('start-chain', async () => {
+      await manager.runOperation('chain-start', async () => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executions.push('chain-start');
+        await sleep(5);
+        executions.push('chain-mid');
+        concurrent--;
+
+        // Emit nested event during operation
+        setTimeout(() => emitter.emit('nested-event'), 1);
+      });
+    });
+
+    emitter.on('nested-event', async () => {
+      await manager.runOperation('chain-nested', async () => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executions.push('nested-start');
+        await sleep(3);
+        executions.push('nested-end');
+        concurrent--;
+        return 'nested-done';
+      });
+    });
+
+    // Start the chain
+    emitter.emit('start-chain');
+
+    // Wait for all operations to complete
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(concurrent).toBe(0);
+    expect(executions).toContain('chain-start');
+    expect(executions).toContain('chain-mid');
+    expect(executions).toContain('nested-start');
+    expect(executions).toContain('nested-end');
+  });
+
+  it('handles rapid event bursts with timeouts', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+
+    emitter.on('burst-timeout', async () => {
+      const promise = manager.runOperation('burst-timeout', async () => {
+        executions.push('burst-start');
+        await sleep(50);
+        executions.push('burst-end');
+        return 'burst-done';
+      }, { timeoutMs: 10 }).catch(err => {
+        if (err instanceof MutexTimeoutError) {
+          executions.push('burst-timeout');
+          return 'timeout';
+        }
+        throw err;
+      });
+
+      // Don't await here to create burst
+      promise.catch(() => {});
+    });
+
+    // Emit multiple burst events rapidly
+    for (let i = 0; i < 10; i++) {
+      emitter.emit('burst-timeout');
+    }
+
+    // Wait for all to resolve/reject
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const timeouts = executions.filter(e => e === 'burst-timeout').length;
+    const successes = executions.filter(e => e === 'burst-start').length;
+
+    // Some should timeout, some should succeed
+    expect(timeouts + successes).toBeGreaterThan(0);
+  });
+
+  it('handles event-driven reentrant operations with competing handlers', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+    let concurrent = 0;
+
+    emitter.on('reentrant-trigger', async () => {
+      await manager.runOperation('event-reentrant', async ({ heldMutexIds }) => {
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executions.push(`outer:${heldMutexIds.join(',')}`);
+
+        // Trigger nested operation via event during outer operation
+        setTimeout(() => emitter.emit('nested-reentrant'), 2);
+
+        await sleep(10);
+        executions.push('outer-waiting');
+        concurrent--;
+        return 'outer-done';
+      });
+    });
+
+    emitter.on('nested-reentrant', async () => {
+      await manager.runOperation('event-reentrant', async ({ heldMutexIds }) => {
+        executions.push(`inner:${heldMutexIds.join(',')}`);
+        await sleep(5);
+        executions.push('inner-done');
+        return 'inner-done';
+      });
+    });
+
+    // Trigger the sequence
+    emitter.emit('reentrant-trigger');
+
+    // Wait for completion
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(executions).toContain('outer:event-reentrant');
+    expect(executions).toContain('inner:event-reentrant');
+    expect(executions).toContain('outer-waiting');
+    expect(executions).toContain('inner-done');
+  });
+
+  it('handles event emitters triggering aborts during operations', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+    let concurrent = 0;
+
+    emitter.on('abort-trigger', async () => {
+      const controller = new AbortController();
+      let operationStarted = false;
+
+      const promise = manager.runOperation('event-abort', async () => {
+        operationStarted = true;
+        concurrent++;
+        expect(concurrent).toBe(1);
+        executions.push('abort-start');
+
+        // Emit event that will abort this operation
+        setTimeout(() => emitter.emit('do-abort', controller), 5);
+
+        await sleep(20);
+        executions.push('abort-end');
+        return 'abort-done';
+      }, { signal: controller.signal }).catch(err => {
+        if (err instanceof MutexAbortedError) {
+          executions.push('aborted');
+          // Only decrement if operation actually started
+          if (operationStarted) {
+            concurrent--;
+          }
+          return 'aborted';
+        }
+        throw err;
+      });
+
+      // Don't await to allow concurrent emissions
+      promise.catch(() => {});
+    });
+
+    emitter.on('do-abort', (controller: AbortController) => {
+      controller.abort('event-triggered-abort');
+    });
+
+    // Trigger multiple operations that will abort each other
+    for (let i = 0; i < 5; i++) {
+      emitter.emit('abort-trigger');
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const aborted = executions.filter(e => e === 'aborted').length;
+    const started = executions.filter(e => e === 'abort-start').length;
+
+    expect(aborted).toBeGreaterThan(0);
+    expect(started).toBeGreaterThan(0);
+    expect(concurrent).toBe(0);
+  });
+
+  it('handles cross-event deadlock scenarios', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+
+    let alphaStarted = false;
+    let betaStarted = false;
+
+    emitter.on('trigger-alpha', async () => {
+      try {
+        await manager.runOperation('alpha', async () => {
+          executions.push('alpha-acquired');
+          alphaStarted = true;
+
+          // Wait for beta to start, then try to acquire beta
+          while (!betaStarted) {
+            await sleep(1);
+          }
+
+          executions.push('alpha-waiting-beta');
+          await manager.runOperation('beta', async () => {
+            executions.push('alpha-got-beta');
+            return 'should-deadlock';
+          });
+
+          return 'alpha-done';
+        });
+      } catch (error) {
+        if (error instanceof MutexDeadlockError) {
+          executions.push('alpha-deadlock');
+        } else {
+          executions.push('alpha-error');
+        }
+      }
+    });
+
+    emitter.on('trigger-beta', async () => {
+      try {
+        await manager.runOperation('beta', async () => {
+          executions.push('beta-acquired');
+          betaStarted = true;
+
+          // Wait for alpha to start, then try to acquire alpha
+          while (!alphaStarted) {
+            await sleep(1);
+          }
+
+          executions.push('beta-waiting-alpha');
+          await manager.runOperation('alpha', async () => {
+            executions.push('beta-got-alpha');
+            return 'should-deadlock';
+          });
+
+          return 'beta-done';
+        });
+      } catch (error) {
+        if (error instanceof MutexDeadlockError) {
+          executions.push('beta-deadlock');
+        } else {
+          executions.push('beta-error');
+        }
+      }
+    });
+
+    // Trigger both operations that will try to create a deadlock
+    emitter.emit('trigger-alpha');
+    emitter.emit('trigger-beta');
+
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // At least one should detect deadlock
+    const deadlocks = executions.filter(e => e.includes('deadlock')).length;
+    expect(deadlocks).toBeGreaterThan(0);
+  });
+
+  it('handles event-driven operations with mixed synchronous emissions', async () => {
+    const manager = new UniqueMutexManager();
+    const emitter = new EventEmitter();
+    const executions: string[] = [];
+    let concurrent1 = 0;
+    let concurrent2 = 0;
+    let concurrent3 = 0;
+
+    emitter.on('sync-trigger', () => {
+      // Emit multiple events synchronously
+      emitter.emit('async-op-1');
+      emitter.emit('async-op-2');
+      emitter.emit('async-op-3');
+    });
+
+    emitter.on('async-op-1', async () => {
+      await manager.runOperation('sync-race-1', async () => {
+        concurrent1++;
+        expect(concurrent1).toBe(1);
+        executions.push('op1-start');
+        await sleep(randomInt(1, 3));
+        executions.push('op1-end');
+        concurrent1--;
+      });
+    });
+
+    emitter.on('async-op-2', async () => {
+      await manager.runOperation('sync-race-2', async () => {
+        concurrent2++;
+        expect(concurrent2).toBe(1);
+        executions.push('op2-start');
+        await sleep(randomInt(1, 3));
+        executions.push('op2-end');
+        concurrent2--;
+      });
+    });
+
+    emitter.on('async-op-3', async () => {
+      await manager.runOperation('sync-race-3', async () => {
+        concurrent3++;
+        expect(concurrent3).toBe(1);
+        executions.push('op3-start');
+        await sleep(randomInt(1, 3));
+        executions.push('op3-end');
+        concurrent3--;
+      });
+    });
+
+    // Trigger the cascade
+    emitter.emit('sync-trigger');
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(concurrent1).toBe(0);
+    expect(concurrent2).toBe(0);
+    expect(concurrent3).toBe(0);
+    expect(executions).toContain('op1-start');
+    expect(executions).toContain('op1-end');
+    expect(executions).toContain('op2-start');
+    expect(executions).toContain('op2-end');
+    expect(executions).toContain('op3-start');
+    expect(executions).toContain('op3-end');
+  });
 });
 
 describe('package loading', () => {
@@ -1239,10 +2016,11 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await sleep(35);
     controller.abort('distributed-abort-signal');
 
-    const error = await queued.catch((err) => err as MutexAbortedError);
+    const error = await queued.catch((err) => err);
     expect(error).toBeInstanceOf(MutexAbortedError);
-    expect(error.id).toBe('distributed-abort');
-    expect(error.reason).toBe('distributed-abort-signal');
+    const abortedError = error as MutexAbortedError;
+    expect(abortedError.id).toBe('distributed-abort');
+    expect(abortedError.reason).toBe('distributed-abort-signal');
 
     releaseBlocker();
     await blocker;
