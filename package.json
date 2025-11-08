@@ -1,6 +1,6 @@
 {
   "name": "uniquemutexmanager",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Unique mutex manager with optional Redis-backed distributed locking",
   "main": "dist/cjs/index.js",
   "module": "dist/esm/index.js",

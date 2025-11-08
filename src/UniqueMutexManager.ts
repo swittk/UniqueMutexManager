@@ -11,7 +11,11 @@ import {
   MutexTimeoutError,
 } from './errors';
 import { Mutex, MutexState } from './mutex';
-import { AsyncLocalStorageLike, createAsyncLocalStorage } from './asyncContext';
+import {
+  AsyncLocalStorageLike,
+  createAsyncLocalStorage,
+  createFallbackAsyncLocalStorage,
+} from './asyncContext';
 import { generateInstanceId } from './id';
 import { importOptionalModule, loadOptionalModule } from './moduleLoader';
 
@@ -122,8 +126,8 @@ export class UniqueMutexManager {
   private readonly createdRedisClients: Array<IORedisClient | IORedisCluster> = [];
   private readonly lockTTL: number;
   private readonly lockExtendInterval: number;
-  private readonly context: AsyncLocalStorageLike<OperationContext>;
-  private readonly supportsAsyncContext: boolean;
+  private context: AsyncLocalStorageLike<OperationContext>;
+  private supportsAsyncContext: boolean;
   private readonly lockOwners = new Map<string, OperationContext>();
   private readonly coordinationClient?: IORedisClient | IORedisCluster;
   private readonly instanceId: string;
@@ -133,13 +137,19 @@ export class UniqueMutexManager {
   private readonly metadataTTL: number;
   private readonly contextTokens = new WeakMap<OperationContext, MutexRunContextInternal>();
   private readonly tokenContexts = new WeakMap<MutexRunContextInternal, OperationContext>();
+  private readonly contextReady: Promise<void>;
 
   private static readonly REDIS_PREFIX = 'uniquemutex';
 
   constructor(options: UniqueMutexManagerOptions = {}) {
-    const asyncContext = createAsyncLocalStorage<OperationContext>();
-    this.context = asyncContext.storage;
-    this.supportsAsyncContext = asyncContext.supportsAsync;
+    this.context = createFallbackAsyncLocalStorage<OperationContext>();
+    this.supportsAsyncContext = false;
+    this.contextReady = createAsyncLocalStorage<OperationContext>()
+      .then(({ storage, supportsAsync }) => {
+        this.context = storage;
+        this.supportsAsyncContext = supportsAsync;
+      })
+      .catch(() => undefined);
     this.lockTTL = options.lockTTL ?? DEFAULT_LOCK_TTL;
     this.lockExtendInterval =
       options.lockExtendInterval ?? Math.max(Math.floor(this.lockTTL / 2), 0);
@@ -387,6 +397,8 @@ export class UniqueMutexManager {
       onAbort?: (abort: (reason?: unknown) => void) => void;
     }
   ): Promise<T> {
+    await this.contextReady;
+
     const waitPreference = opts?.waitIfLocked ?? true;
     const timeoutMs = waitPreference ? opts?.timeoutMs : undefined;
     const requestedContext = this.getContextFromToken(opts?.context);
@@ -587,7 +599,7 @@ export class UniqueMutexManager {
           timedOut = true;
           throw timeoutError;
         }
-        throw new MutexLockedError(id);
+        return undefined as unknown as T;
       }
 
       lockState.pending += 1;

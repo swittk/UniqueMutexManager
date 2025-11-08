@@ -1,5 +1,7 @@
 import type { AsyncLocalStorage as NodeAsyncLocalStorage } from 'node:async_hooks';
 
+import { importOptionalModule, loadOptionalModule } from './moduleLoader';
+
 declare const require: undefined | ((moduleName: string) => unknown);
 
 export type AsyncLocalStorageLike<T> = {
@@ -21,22 +23,20 @@ class StackAsyncLocalStorage<T> implements AsyncLocalStorageLike<T> {
 
   run<R>(store: T, callback: () => R): R {
     this.stack.push(store);
-    let result: R;
+
     try {
-      result = callback();
+      const result = callback();
+      if (isPromise(result)) {
+        this.stack.pop();
+        return result;
+      }
+
+      this.stack.pop();
+      return result;
     } catch (error) {
       this.stack.pop();
       throw error;
     }
-
-    if (isPromise(result)) {
-      return (result as Promise<R>).finally(() => {
-        this.stack.pop();
-      }) as R;
-    }
-
-    this.stack.pop();
-    return result;
   }
 
   getStore(): T | undefined {
@@ -47,7 +47,7 @@ class StackAsyncLocalStorage<T> implements AsyncLocalStorageLike<T> {
   }
 }
 
-function loadNodeAsyncLocalStorage<T>(): NodeAsyncLocalStorage<T> | undefined {
+async function loadNodeAsyncLocalStorage<T>(): Promise<NodeAsyncLocalStorage<T> | undefined> {
   const globalCtor = (globalThis as {
     AsyncLocalStorage?: new () => NodeAsyncLocalStorage<T>;
   }).AsyncLocalStorage;
@@ -55,19 +55,28 @@ function loadNodeAsyncLocalStorage<T>(): NodeAsyncLocalStorage<T> | undefined {
     return new (globalCtor as new () => NodeAsyncLocalStorage<T>)();
   }
 
-  if (typeof require !== 'function') {
-    return undefined;
+  if (typeof require === 'function') {
+    try {
+      const module = loadOptionalModule<{ AsyncLocalStorage?: new () => NodeAsyncLocalStorage<T> }>(
+        'node:async_hooks'
+      );
+      if (module?.AsyncLocalStorage) {
+        return new module.AsyncLocalStorage();
+      }
+    } catch {
+      // ignore
+    }
   }
 
   try {
-    const module = require('node:async_hooks') as {
+    const asyncHooks = await importOptionalModule<{
       AsyncLocalStorage?: new () => NodeAsyncLocalStorage<T>;
-    };
-    if (module?.AsyncLocalStorage) {
-      return new module.AsyncLocalStorage();
+    }>('node:async_hooks');
+    if (asyncHooks?.AsyncLocalStorage) {
+      return new asyncHooks.AsyncLocalStorage();
     }
   } catch {
-    // ignore
+    // ignore failures from dynamic import as well.
   }
 
   return undefined;
@@ -78,11 +87,15 @@ export interface AsyncLocalContext<T> {
   supportsAsync: boolean;
 }
 
-export function createAsyncLocalStorage<T>(): AsyncLocalContext<T> {
-  const nodeInstance = loadNodeAsyncLocalStorage<T>();
+export async function createAsyncLocalStorage<T>(): Promise<AsyncLocalContext<T>> {
+  const nodeInstance = await loadNodeAsyncLocalStorage<T>();
   if (nodeInstance) {
     return { storage: nodeInstance, supportsAsync: true };
   }
 
   return { storage: new StackAsyncLocalStorage<T>(), supportsAsync: false };
+}
+
+export function createFallbackAsyncLocalStorage<T>(): AsyncLocalStorageLike<T> {
+  return new StackAsyncLocalStorage<T>();
 }

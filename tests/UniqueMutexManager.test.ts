@@ -264,15 +264,24 @@ describe('UniqueMutexManager (single process)', () => {
 
   it('can skip queueing when waitIfLocked is false', async () => {
     const manager = new UniqueMutexManager();
+    let executed = false;
+
     const first = manager.runOperation('gamma', async () => {
       await sleep(50);
       return 'first';
     });
 
-    await expect(
-      manager.runOperation('gamma', async () => 'second', { waitIfLocked: false })
-    ).rejects.toBeInstanceOf(MutexLockedError);
+    const second = await manager.runOperation(
+      'gamma',
+      async () => {
+        executed = true;
+        return 'second';
+      },
+      { waitIfLocked: false }
+    );
 
+    expect(second).toBeUndefined();
+    expect(executed).toBe(false);
     await expect(first).resolves.toBe('first');
   });
 
@@ -1241,11 +1250,11 @@ describe('UniqueMutexManager (single process)', () => {
         await sleep(5);
         concurrent--;
         return `task-${i}`;
-      }, { waitIfLocked: wait }).catch(err => {
-        if (err instanceof MutexLockedError) {
-          return `locked-${i}`;
+      }, { waitIfLocked: wait }).then((result) => {
+        if (result === undefined) {
+          return `skipped-${i}`;
         }
-        throw err;
+        return result;
       });
       tasks.push(task);
     }
@@ -1253,10 +1262,10 @@ describe('UniqueMutexManager (single process)', () => {
     const results = await Promise.all(tasks);
     await longRunner;
 
-    const locked = results.filter(r => r.startsWith('locked-')).length;
+    const skipped = results.filter(r => r.startsWith('skipped-')).length;
     const executedTasks = results.filter(r => r.startsWith('task-')).length;
 
-    expect(locked).toBeGreaterThan(0);
+    expect(skipped).toBeGreaterThan(0);
     expect(executedTasks).toBeGreaterThan(0);
     expect(concurrent).toBe(0);
   });
@@ -1967,9 +1976,18 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
 
     await startedPromise;
 
-    await expect(
-      managerB.runOperation('rapid', async () => 'should not run', { waitIfLocked: false })
-    ).rejects.toBeInstanceOf(MutexLockedError);
+    let executed = false;
+    const skipped = await managerB.runOperation(
+      'rapid',
+      async () => {
+        executed = true;
+        return 'should not run';
+      },
+      { waitIfLocked: false }
+    );
+
+    expect(skipped).toBeUndefined();
+    expect(executed).toBe(false);
 
     await running;
     await managerA.dispose();
