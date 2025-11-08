@@ -1,11 +1,11 @@
 {
   "name": "uniquemutexmanager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unique mutex manager with optional Redis-backed distributed locking",
   "main": "dist/cjs/index.js",
   "module": "dist/esm/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json",
+    "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json && node scripts/postbuild.cjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
