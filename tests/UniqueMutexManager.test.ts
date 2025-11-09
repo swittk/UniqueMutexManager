@@ -3,6 +3,7 @@ import type { ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import { randomInt } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 
 import IORedis from 'ioredis';
@@ -1908,6 +1909,7 @@ const describeDistributed = redisAvailable ? describe : describe.skip;
 describeDistributed('UniqueMutexManager (distributed via redis)', () => {
   const redisPort = 6380;
   const redisUrl = `redis://127.0.0.1:${redisPort}`;
+  const registerPath = path.join(__dirname, 'helpers', 'register-ts.js');
   let redisProcess: ChildProcessWithoutNullStreams | undefined;
 
   beforeAll(async () => {
@@ -2107,6 +2109,150 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await Promise.all(managers.map((manager) => manager.dispose()));
   });
 
+  it('serializes distributed operations across worker threads', async () => {
+    const workerScript = path.join(__dirname, 'helpers', 'distributed-thread-worker.js');
+    const workerCount = 3;
+    const operationsPerWorker = 4;
+    const workers: Worker[] = [];
+    const readyPromises: Promise<void>[] = [];
+    const completionPromises: Promise<void>[] = [];
+    const completions = new Map<string, number[]>();
+    let active = 0;
+
+    const isReadyMessage = (message: unknown): message is { type: 'ready'; workerId: string } =>
+      isTypedMessage(message, 'ready') && typeof message.workerId === 'string';
+
+    const isDoneMessage = (message: unknown): message is { type: 'done'; workerId: string } =>
+      isTypedMessage(message, 'done') && typeof message.workerId === 'string';
+
+    const isErrorMessage = (
+      message: unknown
+    ): message is { type: 'error'; workerId: string; message: string; name?: string } =>
+      isTypedMessage(message, 'error') &&
+      typeof message.workerId === 'string' &&
+      typeof message.message === 'string';
+
+    for (let index = 0; index < workerCount; index += 1) {
+      const workerId = `thread-${index}`;
+      const worker = new Worker(workerScript, {
+        workerData: {
+          redisUrl,
+          workerId,
+          mutexId: 'thread-shared',
+          operations: operationsPerWorker,
+          delayMs: 5,
+          lockTTL: 200,
+          lockExtendInterval: 0,
+        },
+      });
+
+      workers.push(worker);
+      completions.set(workerId, []);
+
+      readyPromises.push(
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const cleanup = () => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            worker.off('message', handleMessage);
+            worker.off('error', handleError);
+          };
+
+          const handleMessage = (message: unknown) => {
+            if (isReadyMessage(message)) {
+              cleanup();
+              resolve();
+            } else if (isErrorMessage(message)) {
+              cleanup();
+              reject(new Error(`${message.workerId}: ${message.message}`));
+            }
+          };
+
+          const handleError = (error: Error) => {
+            cleanup();
+            reject(error);
+          };
+
+          worker.on('message', handleMessage);
+          worker.once('error', handleError);
+        })
+      );
+
+      completionPromises.push(
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const cleanup = () => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            worker.off('message', handleMessage);
+            worker.off('error', handleError);
+            worker.off('exit', handleExit);
+          };
+
+          const handleMessage = (message: unknown) => {
+            if (isTypedMessage(message, 'started') && typeof message.workerId === 'string') {
+              active += 1;
+              expect(active).toBe(1);
+            } else if (isTypedMessage(message, 'ended') && typeof message.workerId === 'string') {
+              active -= 1;
+              expect(active).toBe(0);
+              const list = completions.get(message.workerId);
+              if (list) {
+                const endedIndex = (message as { index?: unknown }).index;
+                if (typeof endedIndex === 'number') {
+                  list.push(endedIndex);
+                }
+              }
+            } else if (isDoneMessage(message)) {
+              cleanup();
+              resolve();
+            } else if (isErrorMessage(message)) {
+              cleanup();
+              reject(new Error(`${message.workerId}: ${message.message}`));
+            }
+          };
+
+          const handleError = (error: Error) => {
+            cleanup();
+            reject(error);
+          };
+
+          const handleExit = (code: number) => {
+            if (code !== 0) {
+              cleanup();
+              reject(new Error(`Worker ${workerId} exited with code ${code}`));
+            }
+          };
+
+          worker.on('message', handleMessage);
+          worker.once('error', handleError);
+          worker.once('exit', handleExit);
+        })
+      );
+    }
+
+    await Promise.all(readyPromises);
+    for (const worker of workers) {
+      worker.postMessage({ type: 'start' });
+    }
+
+    await Promise.all(completionPromises);
+
+    for (const worker of workers) {
+      await worker.terminate();
+    }
+
+    expect(active).toBe(0);
+    for (const [workerId, list] of completions.entries()) {
+      expect(list).toEqual([...Array(operationsPerWorker).keys()]);
+    }
+  });
+
   it('processes randomized bursts across managers and ids deterministically', async () => {
     const managers = Array.from({ length: 4 }, () => new UniqueMutexManager({ redis: { urls: [redisUrl] } }));
     const keys = ['alpha', 'beta', 'gamma'];
@@ -2154,8 +2300,56 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await Promise.all(managers.map((manager) => manager.dispose()));
   });
 
+  it('recovers when a waiting process exits while holding the distributed lock', async () => {
+    const lockTTL = 200;
+    const workerScript = path.join(__dirname, 'helpers', 'distributed-lock-holder.ts');
+    const holder = fork(workerScript, {
+      env: {
+        ...process.env,
+        REDIS_URL: redisUrl,
+        LOCK_TTL: String(lockTTL),
+        LOCK_EXTEND_INTERVAL: '0',
+      },
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+      execArgv: [...process.execArgv, '-r', registerPath],
+    });
+
+    const queue = createMessageQueue(holder);
+    const isReadyMessage = (message: unknown): message is { type: 'ready' } =>
+      isTypedMessage(message, 'ready');
+    const isAcquiredMessage = (message: unknown): message is { type: 'acquired'; id: string } =>
+      isTypedMessage(message, 'acquired') && typeof message.id === 'string';
+
+    await queue.waitFor(isReadyMessage);
+
+    holder.send({ type: 'acquire', id: 'crash-lock' });
+    await queue.waitFor(isAcquiredMessage, 5_000);
+
+    const manager = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      lockTTL,
+      lockExtendInterval: 0,
+    });
+
+    try {
+      const start = Date.now();
+      const resultPromise = manager.runOperation('crash-lock', async () => Date.now());
+
+      await sleep(50);
+      holder.kill('SIGKILL');
+      await once(holder, 'exit');
+
+      const completionTime = await resultPromise;
+      const elapsed = completionTime - start;
+
+      expect(elapsed).toBeGreaterThanOrEqual(lockTTL);
+      expect(elapsed).toBeLessThan(4_000);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it('detects deadlocks spanning multiple managers across processes', async () => {
-    const registerPath = path.join(__dirname, 'helpers', 'register-ts.js');
     const workerScript = path.join(__dirname, 'helpers', 'distributed-deadlock-worker.ts');
 
     type ReadyMessage = { type: 'ready'; workerId: string };

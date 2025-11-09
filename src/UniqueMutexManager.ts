@@ -121,7 +121,31 @@ function isResourceLockedError(error: unknown): boolean {
   return isErrorWithName(error, 'ResourceLockedError');
 }
 
+function extractRedisString(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
+    return value.toString();
+  }
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const entry = extractRedisString(value[index]);
+      if (entry !== undefined) {
+        return entry;
+      }
+    }
+  }
+  return undefined;
+}
+
 export class UniqueMutexManager {
+  private static globalRequestCounter = 0;
+  private static registrationLocks = new Map<string, Promise<void>>();
+
   private readonly locks = new Map<string, LockState>();
   private readonly createdRedisClients: Array<IORedisClient | IORedisCluster> = [];
   private readonly lockTTL: number;
@@ -138,6 +162,9 @@ export class UniqueMutexManager {
   private readonly contextTokens = new WeakMap<OperationContext, MutexRunContextInternal>();
   private readonly tokenContexts = new WeakMap<MutexRunContextInternal, OperationContext>();
   private readonly contextReady: Promise<void>;
+  private queueTokenCounter = 0;
+  private readonly requestQueues = new Map<string, number[]>();
+  private readonly queueEntryTTL: number;
 
   private static readonly REDIS_PREFIX = 'uniquemutex';
 
@@ -154,6 +181,7 @@ export class UniqueMutexManager {
     this.lockExtendInterval =
       options.lockExtendInterval ?? Math.max(Math.floor(this.lockTTL / 2), 0);
     this.metadataTTL = Math.max(this.lockTTL * 20, 10 * 60_000);
+    this.queueEntryTTL = Math.max(this.lockTTL * 4, 2_000);
     this.instanceId = generateInstanceId();
 
     if (options.redlock) {
@@ -397,14 +425,8 @@ export class UniqueMutexManager {
       onAbort?: (abort: (reason?: unknown) => void) => void;
     }
   ): Promise<T> {
-    await this.contextReady;
-
-    const waitPreference = opts?.waitIfLocked ?? true;
-    const timeoutMs = waitPreference ? opts?.timeoutMs : undefined;
-    const requestedContext = this.getContextFromToken(opts?.context);
-    const existingContext = this.context.getStore();
-    const context = requestedContext ?? existingContext ?? this.allocateContext();
-    this.ensureContextToken(context);
+    const requestTime = Date.now();
+    const requestSequence = ++UniqueMutexManager.globalRequestCounter;
 
     const abortController = new AbortController();
     const abortSignal = abortController.signal;
@@ -450,36 +472,73 @@ export class UniqueMutexManager {
       }
     }
 
-    const run = async () => {
-      try {
-        return await this.runWithContext(
-          id,
-          operation,
-          waitPreference,
-          timeoutMs,
-          context,
-          abortSignal,
-          abort,
-          abortable,
-          registerAbortCallback
-        );
-      } finally {
-        for (const cleanup of cleanupListeners) {
-          try {
-            cleanup();
-          } catch {
-            // Ignore listener cleanup errors.
-          }
-        }
-        abortCallbacks.length = 0;
+    const waitPreference = opts?.waitIfLocked ?? true;
+    const timeoutMs = waitPreference ? opts?.timeoutMs : undefined;
+    const canWait = waitPreference && (timeoutMs === undefined || timeoutMs > 0);
+
+    const requestQueue = this.getRequestQueue(id);
+    requestQueue.push(requestSequence);
+    let queueEntryRemoved = false;
+    const ensureQueueEntryRemoved = () => {
+      if (!queueEntryRemoved) {
+        this.removeRequestFromQueue(id, requestSequence);
+        queueEntryRemoved = true;
       }
     };
+    try {
+      const preQueueToken = canWait
+        ? await this.enqueueDistributedQueue(id, requestTime, requestSequence)
+        : undefined;
 
-    if (existingContext === context) {
-      return run();
+      await this.contextReady;
+
+      const requestedContext = this.getContextFromToken(opts?.context);
+      const existingContext = this.context.getStore();
+      const context = requestedContext ?? existingContext ?? this.allocateContext();
+      this.ensureContextToken(context);
+
+      const run = async () => {
+        try {
+          return await this.runWithContext(
+            id,
+            operation,
+            waitPreference,
+            timeoutMs,
+            requestTime,
+            requestSequence,
+            ensureQueueEntryRemoved,
+            preQueueToken,
+            context,
+            abortSignal,
+            abort,
+            abortable,
+            registerAbortCallback
+          );
+        } finally {
+          for (const cleanup of cleanupListeners) {
+            try {
+              cleanup();
+            } catch {
+              // Ignore listener cleanup errors.
+            }
+          }
+          abortCallbacks.length = 0;
+        }
+      };
+
+      if (existingContext === context) {
+        return run();
+      }
+
+      return this.context.run(context, run);
+    } catch (error) {
+      ensureQueueEntryRemoved();
+      const lockState = this.locks.get(id);
+      if (lockState) {
+        this.cleanupLockStateIfIdle(id, lockState);
+      }
+      throw error;
     }
-
-    return this.context.run(context, run);
   }
 
   private async runWithContext<T>(
@@ -487,16 +546,26 @@ export class UniqueMutexManager {
     operation: OperationType<T>,
     waitPreference: boolean,
     timeoutMs: number | undefined,
+    requestTime: number,
+    requestSequence: number,
+    removeQueueEntry: () => void,
+    preQueueToken: string | undefined,
     context: OperationContext,
     abortSignal: AbortSignal,
     abortFn: (reason?: unknown) => void,
     abortable: boolean,
     registerAbortCallback: (callback: (reason?: unknown) => void) => () => void
   ): Promise<T> {
-    const requestTime = Date.now();
     const lockState = this.getOrCreateLockState(id);
     const mutex = new Mutex(id, lockState);
     const contextToken = this.ensureContextToken(context);
+    let queueEntryRemoved = false;
+    const ensureQueueEntryRemoved = () => {
+      if (!queueEntryRemoved) {
+        removeQueueEntry();
+        queueEntryRemoved = true;
+      }
+    };
     const timeoutError =
       waitPreference && timeoutMs !== undefined ? new MutexTimeoutError(id, timeoutMs) : undefined;
     const canWait = waitPreference && (timeoutMs === undefined || timeoutMs > 0);
@@ -506,6 +575,8 @@ export class UniqueMutexManager {
     const abortListeners: Array<() => void> = [];
 
     if (abortSignal.aborted) {
+      ensureQueueEntryRemoved();
+      this.cleanupLockStateIfIdle(id, lockState);
       throw new MutexAbortedError(id, abortSignal.reason);
     }
 
@@ -590,15 +661,25 @@ export class UniqueMutexManager {
           if (releaseResult.handle) {
             await releaseResult.handle.release().catch(() => undefined);
           }
+          ensureQueueEntryRemoved();
+          this.cleanupLockStateIfIdle(id, lockState);
         }
       }
 
-      const alreadyLocked = lockState.pending > 0;
+      const queue = this.requestQueues.get(id);
+      const hasEarlierRequest = Boolean(
+        queue && queue.includes(requestSequence) && queue[0] !== requestSequence
+      );
+      const alreadyLocked = lockState.pending > 0 || hasEarlierRequest;
       if (!canWait && alreadyLocked) {
         if (timeoutError) {
           timedOut = true;
+          ensureQueueEntryRemoved();
+          this.cleanupLockStateIfIdle(id, lockState);
           throw timeoutError;
         }
+        ensureQueueEntryRemoved();
+        this.cleanupLockStateIfIdle(id, lockState);
         return undefined as unknown as T;
       }
 
@@ -651,6 +732,7 @@ export class UniqueMutexManager {
           let distributedLock: DistributedLockHandle | undefined;
           let waitingCleared = !waitingMarked;
           let operationStarted = false;
+          let queueToken: string | undefined = preQueueToken;
 
           try {
             if (timeoutError && timedOut) {
@@ -662,11 +744,29 @@ export class UniqueMutexManager {
               throw new MutexAbortedError(id, abortSignal.reason);
             }
 
+            if (canWait) {
+              if (!queueToken) {
+                queueToken = await this.enqueueDistributedQueue(id, requestTime, requestSequence);
+              }
+              if (queueToken) {
+                try {
+                  await this.waitForDistributedTurn(id, queueToken, abortSignal);
+                } catch (error) {
+                  await this.removeDistributedQueueEntry(id, queueToken);
+                  queueToken = undefined;
+                  throw error;
+                }
+              }
+            }
+
             try {
               distributedLock = await this.acquireDistributedLock(id, canWait);
             } catch (error) {
               if (timeoutError && error instanceof MutexLockedError) {
                 throw timeoutError;
+              }
+              if (!canWait && error instanceof MutexLockedError) {
+                return undefined as unknown as T;
               }
               throw error;
             }
@@ -736,10 +836,14 @@ export class UniqueMutexManager {
               }
             }
 
-            lockState.pending -= 1;
-            if (lockState.pending === 0) {
-              this.locks.delete(id);
+            if (queueToken) {
+              await this.removeDistributedQueueEntry(id, queueToken);
+              queueToken = undefined;
             }
+
+            lockState.pending -= 1;
+            ensureQueueEntryRemoved();
+            this.cleanupLockStateIfIdle(id, lockState);
           }
         };
 
@@ -748,9 +852,8 @@ export class UniqueMutexManager {
         rejectReady = undefined;
       } catch (error) {
         lockState.pending -= 1;
-        if (lockState.pending === 0) {
-          this.locks.delete(id);
-        }
+        ensureQueueEntryRemoved();
+        this.cleanupLockStateIfIdle(id, lockState);
         rejectReady?.(error);
         resolveReady = undefined;
         rejectReady = undefined;
@@ -885,6 +988,70 @@ export class UniqueMutexManager {
     return `${UniqueMutexManager.REDIS_PREFIX}:owner:${id}`;
   }
 
+  private getQueueKey(id: string): string {
+    return `${UniqueMutexManager.REDIS_PREFIX}:queue:${id}`;
+  }
+
+  private getQueuePositionKey(id: string): string {
+    return `${UniqueMutexManager.REDIS_PREFIX}:queue:${id}:pos`;
+  }
+
+  private getQueueTurnKey(id: string): string {
+    return `${UniqueMutexManager.REDIS_PREFIX}:queue:${id}:turn`;
+  }
+
+  private getQueueEntryPrefix(id: string): string {
+    return `${UniqueMutexManager.REDIS_PREFIX}:queue:${id}:entry:`;
+  }
+
+  private getQueueEntryKey(id: string, position: string | number): string {
+    return `${this.getQueueEntryPrefix(id)}${position}`;
+  }
+
+  private getRequestQueue(id: string): number[] {
+    let queue = this.requestQueues.get(id);
+    if (!queue) {
+      queue = [];
+      this.requestQueues.set(id, queue);
+    }
+    return queue;
+  }
+
+  private removeRequestFromQueue(id: string, sequence: number): void {
+    const queue = this.requestQueues.get(id);
+    if (!queue) {
+      return;
+    }
+
+    const index = queue.indexOf(sequence);
+    if (index !== -1) {
+      queue.splice(index, 1);
+    }
+
+    if (queue.length === 0) {
+      this.requestQueues.delete(id);
+    }
+  }
+
+  private cleanupLockStateIfIdle(id: string, lockState: LockState): void {
+    if (lockState.pending === 0) {
+      const queue = this.requestQueues.get(id);
+      if (!queue || queue.length === 0) {
+        this.locks.delete(id);
+      }
+    }
+  }
+
+  private getQueueToken(
+    requestTime: number,
+    requestSequence: number
+  ): string {
+    const timeComponent = requestTime.toString().padStart(13, '0');
+    const sequenceComponent = requestSequence.toString().padStart(16, '0');
+    const localComponent = (++this.queueTokenCounter).toString().padStart(8, '0');
+    return `${timeComponent}:${sequenceComponent}:${this.instanceId}:${localComponent}`;
+  }
+
   private updateWaitingState(
     context: OperationContext,
     waitingFor?: string
@@ -918,6 +1085,256 @@ export class UniqueMutexManager {
       .catch(() => undefined);
   }
 
+  private async enqueueDistributedQueue(
+    id: string,
+    requestTime: number,
+    requestSequence: number
+  ): Promise<string | undefined> {
+    if (!this.coordinationClient) {
+      return undefined;
+    }
+
+    const positionKey = this.getQueuePositionKey(id);
+    const turnKey = this.getQueueTurnKey(id);
+
+    const previous = UniqueMutexManager.registrationLocks.get(id) ?? Promise.resolve();
+    let releaseLock: (() => void) | undefined;
+    const current = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    UniqueMutexManager.registrationLocks.set(id, current);
+
+    try {
+      await previous;
+
+      const result = await this.coordinationClient.eval(
+        `local posKey = KEYS[1]
+local turnKey = KEYS[2]
+local ttl = tonumber(ARGV[1])
+local entryTtl = tonumber(ARGV[2])
+local entryPrefix = ARGV[3]
+local position = redis.call('INCR', posKey)
+redis.call('PEXPIRE', posKey, ttl)
+if redis.call('EXISTS', turnKey) == 0 then
+  redis.call('SET', turnKey, 1, 'PX', ttl)
+else
+  redis.call('PEXPIRE', turnKey, ttl)
+end
+redis.call('SET', entryPrefix .. position, '', 'PX', entryTtl)
+return tostring(position)
+`,
+        2,
+        positionKey,
+        turnKey,
+        this.metadataTTL.toString(),
+        this.queueEntryTTL.toString(),
+        this.getQueueEntryPrefix(id)
+      );
+      return extractRedisString(result);
+    } catch {
+      return undefined;
+    } finally {
+      releaseLock?.();
+    }
+  }
+
+  private async waitForDistributedTurn(
+    id: string,
+    token: string,
+    abortSignal: AbortSignal
+  ): Promise<void> {
+    if (!this.coordinationClient) {
+      return;
+    }
+
+    const position = Number(token);
+    if (!Number.isFinite(position)) {
+      return;
+    }
+
+    const turnKey = this.getQueueTurnKey(id);
+    const entryKey = this.getQueueEntryKey(id, token);
+
+    while (true) {
+      if (abortSignal.aborted) {
+        const reason = abortSignal.reason;
+        if (reason instanceof Error) {
+          throw reason;
+        }
+        throw new MutexAbortedError(id, reason);
+      }
+
+      try {
+        await this.coordinationClient.pexpire(entryKey, this.queueEntryTTL);
+      } catch {
+        // Ignore heartbeat failures.
+      }
+
+      let currentTurn: number | undefined;
+
+      try {
+        const rawCurrent = await this.coordinationClient.get(turnKey);
+        const current = rawCurrent === null ? undefined : extractRedisString(rawCurrent);
+        if (current !== undefined) {
+          const turn = Number(current);
+          if (!Number.isNaN(turn)) {
+            currentTurn = turn;
+            if (turn === position) {
+              return;
+            }
+            if (turn > position) {
+              return;
+            }
+          }
+        } else if (position === 1) {
+          try {
+            const setResult = await this.coordinationClient.set(
+              turnKey,
+              token,
+              'PX',
+              this.metadataTTL,
+              'NX'
+            );
+            if (setResult) {
+              return;
+            }
+          } catch {
+            // Ignore failures to initialize the turn.
+          }
+        }
+      } catch {
+        // If we can't read the turn, allow retry.
+      }
+
+      if (currentTurn !== undefined && currentTurn < position) {
+        await this.advanceDistributedTurnIfMissing(id, currentTurn);
+      } else if (currentTurn === undefined && position > 1) {
+        await this.advanceDistributedTurnIfMissing(id, position - 1);
+      }
+
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10);
+      });
+    }
+  }
+
+  private async advanceDistributedTurnIfMissing(id: string, position: number): Promise<void> {
+    if (!this.coordinationClient) {
+      return;
+    }
+
+    if (!Number.isFinite(position) || position < 1) {
+      return;
+    }
+
+    const entryKey = this.getQueueEntryKey(id, position);
+    const turnKey = this.getQueueTurnKey(id);
+    const positionKey = this.getQueuePositionKey(id);
+
+    try {
+      await this.coordinationClient.eval(
+        `local entryKey = KEYS[1]
+local turnKey = KEYS[2]
+local posKey = KEYS[3]
+local position = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+if position == nil then
+  return 0
+end
+if redis.call('EXISTS', entryKey) == 1 then
+  return 0
+end
+local highest = redis.call('GET', posKey)
+if highest == false then
+  redis.call('DEL', turnKey)
+  return 1
+end
+local highestNum = tonumber(highest)
+if highestNum ~= nil and highestNum <= position then
+  redis.call('DEL', posKey)
+  redis.call('DEL', turnKey)
+  return 1
+end
+redis.call('SET', turnKey, position + 1, 'PX', ttl)
+redis.call('PEXPIRE', posKey, ttl)
+return 1
+`,
+        3,
+        entryKey,
+        turnKey,
+        positionKey,
+        position.toString(),
+        this.metadataTTL.toString()
+      );
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+
+  private async removeDistributedQueueEntry(id: string, token: string): Promise<void> {
+    if (!this.coordinationClient) {
+      return;
+    }
+
+    const position = Number(token);
+    if (!Number.isFinite(position)) {
+      return;
+    }
+
+    const turnKey = this.getQueueTurnKey(id);
+    const positionKey = this.getQueuePositionKey(id);
+
+    try {
+      await this.coordinationClient.eval(
+        `local turnKey = KEYS[1]
+local posKey = KEYS[2]
+local position = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local entryPrefix = ARGV[3]
+redis.call('DEL', entryPrefix .. position)
+local current = redis.call('GET', turnKey)
+if current ~= false then
+  local currentNum = tonumber(current)
+  if currentNum ~= nil and currentNum <= position then
+    redis.call('SET', turnKey, position + 1, 'PX', ttl)
+  else
+    redis.call('PEXPIRE', turnKey, ttl)
+  end
+else
+  redis.call('SET', turnKey, position + 1, 'PX', ttl)
+end
+local highest = redis.call('GET', posKey)
+if highest == false then
+  redis.call('DEL', turnKey)
+  return 1
+end
+local highestNum = tonumber(highest)
+local nextTurn = redis.call('GET', turnKey)
+if nextTurn == false then
+  redis.call('DEL', posKey)
+  return 1
+end
+local nextTurnNum = tonumber(nextTurn)
+if nextTurnNum ~= nil and highestNum ~= nil and nextTurnNum > highestNum then
+  redis.call('DEL', turnKey)
+  redis.call('DEL', posKey)
+else
+  redis.call('PEXPIRE', posKey, ttl)
+end
+return 1
+`,
+        2,
+        turnKey,
+        positionKey,
+        token,
+        this.metadataTTL.toString(),
+        this.getQueueEntryPrefix(id)
+      );
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+
   private async setRemoteOwner(id: string, context: OperationContext): Promise<void> {
     if (!this.coordinationClient) {
       return;
@@ -942,7 +1359,8 @@ export class UniqueMutexManager {
 
     try {
       const key = this.getOwnerKey(id);
-      const owner = await this.coordinationClient.get(key);
+      const rawOwner = await this.coordinationClient.get(key);
+      const owner = rawOwner === null ? undefined : extractRedisString(rawOwner);
       if (owner === contextId) {
         await this.coordinationClient.del(key);
       }
@@ -957,8 +1375,11 @@ export class UniqueMutexManager {
     }
 
     try {
-      const owner = await this.coordinationClient.get(this.getOwnerKey(id));
-      return owner ?? undefined;
+      const rawOwner = await this.coordinationClient.get(this.getOwnerKey(id));
+      if (rawOwner === null) {
+        return undefined;
+      }
+      return extractRedisString(rawOwner);
     } catch {
       return undefined;
     }
@@ -974,7 +1395,10 @@ export class UniqueMutexManager {
         this.getContextKey(contextId),
         'waitingFor'
       );
-      return waitingFor ?? undefined;
+      if (waitingFor === null) {
+        return undefined;
+      }
+      return extractRedisString(waitingFor);
     } catch {
       return undefined;
     }
