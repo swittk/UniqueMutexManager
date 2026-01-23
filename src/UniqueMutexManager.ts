@@ -5,6 +5,7 @@ import type { ExecutionError, Lock as RedlockLock, Settings as RedlockSettings }
 
 import {
   DistributedLockError,
+  LockExtensionError,
   MutexAbortedError,
   MutexDeadlockError,
   MutexLockedError,
@@ -26,6 +27,12 @@ export type OperationType<T = unknown> = (args: {
   heldMutexIds: string[];
   contextToken: MutexRunContext;
   abortSignal: AbortSignal;
+  /**
+   * Throws LockExtensionError if the lock extension has failed.
+   * Call this between steps in your operation to detect lock loss early
+   * and prevent work on stale locks.
+   */
+  assertLock: () => void;
 }) => Promise<T>;
 
 interface LockState extends MutexState {
@@ -79,6 +86,11 @@ export interface UniqueMutexManagerOptions {
 
 interface DistributedLockHandle {
   release: () => Promise<void>;
+  /** Set to true when lock extension fails */
+  extensionFailed: boolean;
+  extensionError?: Error;
+  /** Called when extension fails - can be used to abort the operation */
+  onExtensionFailure?: (error: Error) => void;
 }
 
 const DEFAULT_LOCK_TTL = 30_000;
@@ -302,7 +314,7 @@ export class UniqueMutexManager {
   ): Promise<DistributedLockHandle> {
     const redlock = await this.ensureRedlock();
     if (!redlock) {
-      return { release: async () => {} };
+      return { release: async () => { }, extensionFailed: false };
     }
 
     const resource = `uniquemutex:${id}`;
@@ -310,15 +322,17 @@ export class UniqueMutexManager {
 
     try {
       const lock = await redlock.acquire([resource], this.lockTTL, settings);
-      const timer = this.createLockExtension(lock);
-      return {
+      const handle: DistributedLockHandle = {
         release: async () => {
           if (timer) {
             clearInterval(timer);
           }
           await lock.release();
         },
+        extensionFailed: false,
       };
+      const timer = this.createLockExtension(lock, id, handle);
+      return handle;
     } catch (error) {
       if (isResourceLockedError(error) || (!waitIfLocked && isExecutionError(error))) {
         throw new MutexLockedError(id, `Distributed mutex with id "${id}" is already locked`);
@@ -329,7 +343,11 @@ export class UniqueMutexManager {
     }
   }
 
-  private createLockExtension(lock: RedlockLock): ReturnType<typeof setInterval> | undefined {
+  private createLockExtension(
+    lock: RedlockLock,
+    id: string,
+    handle: DistributedLockHandle
+  ): ReturnType<typeof setInterval> | undefined {
     if (!this.redlock) {
       return undefined;
     }
@@ -338,11 +356,57 @@ export class UniqueMutexManager {
       return undefined;
     }
 
+    // Allow up to 3 consecutive extension failures before aborting
+    // This handles transient network issues while still detecting lock loss
+    const maxConsecutiveFailures = 3;
+    let consecutiveFailures = 0;
+
     const interval = setInterval(async () => {
+      // STRICT CHECK 1: If lock has already expired, we must abort immediately
+      // This prevents overlap if we're in a retry loop but time has run out
+      if (Date.now() >= lock.expiration) {
+        handle.extensionFailed = true;
+        const expiryError = new LockExtensionError(id,
+          `Lock for mutex "${id}" has expired (local time > expiration). Aborting immediately to prevent overlap.`
+        );
+        handle.extensionError = expiryError;
+        if (handle.onExtensionFailure) {
+          try { handle.onExtensionFailure(expiryError); } catch { }
+        }
+        clearInterval(interval);
+        return;
+      }
+
       try {
         await lock.extend(this.lockTTL);
-      } catch {
-        // If extending fails we let the operation continue; release will throw later.
+        consecutiveFailures = 0; // Reset on success
+      } catch (error) {
+        consecutiveFailures++;
+
+        // STRICT CHECK 2: Even if we have retries left, if we are now expired, we must abort.
+        if (Date.now() >= lock.expiration) {
+          consecutiveFailures = maxConsecutiveFailures + 1; // Force failure logic below
+        }
+
+        // Only abort after multiple consecutive failures OR if we expired
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          // Mark the handle as failed - operation should abort
+          handle.extensionFailed = true;
+          const extensionError = new LockExtensionError(id,
+            `Lock extension failed ${consecutiveFailures} times for mutex "${id}": ${error instanceof Error ? error.message : 'unknown error'}`
+          );
+          handle.extensionError = extensionError;
+          // Call the failure callback if registered
+          if (handle.onExtensionFailure) {
+            try {
+              handle.onExtensionFailure(extensionError);
+            } catch {
+              // Ignore callback errors
+            }
+          }
+          // Stop trying to extend
+          clearInterval(interval);
+        }
       }
     }, this.lockExtendInterval);
 
@@ -576,6 +640,10 @@ export class UniqueMutexManager {
             heldMutexIds: this.getHeldMutexIds(context),
             contextToken,
             abortSignal,
+            assertLock: () => {
+              // No-op for reentrant case as we don't manage the lock handle here
+              // The parent operation would manage the lock extension
+            },
           });
           if (aborted || abortSignal.aborted) {
             markAborted();
@@ -702,6 +770,14 @@ export class UniqueMutexManager {
               await this.setRemoteOwner(id, context);
             }
 
+            // Register extension failure handler to abort the operation
+            if (distributedLock && distributedLock.onExtensionFailure === undefined) {
+              distributedLock.onExtensionFailure = (error) => {
+                // Abort the operation when extension fails
+                abortFn(error);
+              };
+            }
+
             const startTime = Date.now();
             const result = await operation({
               requestTime,
@@ -710,7 +786,22 @@ export class UniqueMutexManager {
               heldMutexIds: this.getHeldMutexIds(context),
               contextToken,
               abortSignal,
+              assertLock: () => {
+                if (distributedLock?.extensionFailed) {
+                  throw distributedLock.extensionError || new LockExtensionError(id,
+                    `Lock extension failed during operation for mutex "${id}" - mutual exclusivity has been lost`
+                  );
+                }
+              },
             });
+
+            // Check if extension failed during operation
+            if (distributedLock?.extensionFailed) {
+              throw distributedLock.extensionError || new LockExtensionError(id,
+                `Lock extension failed during operation for mutex "${id}" - mutual exclusivity may have been compromised`
+              );
+            }
+
             if (aborted || abortSignal.aborted) {
               markAborted();
               throw new MutexAbortedError(id, abortSignal.reason);

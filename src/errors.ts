@@ -39,6 +39,16 @@ export class DistributedLockError extends Error {
   }
 }
 
+export class LockExtensionError extends Error {
+  public readonly id: string;
+
+  constructor(id: string, message?: string) {
+    super(message ?? `Lock extension failed for mutex "${id}" - lock may have expired`);
+    this.name = 'LockExtensionError';
+    this.id = id;
+  }
+}
+
 export class MutexDeadlockError extends Error {
   public readonly requestedId: string;
   public readonly cycle: string[];
