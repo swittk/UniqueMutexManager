@@ -4,6 +4,7 @@ import type { ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import { randomInt } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 
 import IORedis from 'ioredis';
@@ -2069,6 +2070,7 @@ const describeDistributed = redisAvailable ? describe : describe.skip;
 describeDistributed('UniqueMutexManager (distributed via redis)', () => {
   const redisPort = 6380;
   const redisUrl = `redis://127.0.0.1:${redisPort}`;
+  const registerPath = path.join(__dirname, 'helpers', 'register-ts.js');
   let redisProcess: ChildProcessWithoutNullStreams | undefined;
 
   beforeAll(async () => {
@@ -2320,8 +2322,56 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await Promise.all(managers.map((manager) => manager.dispose()));
   });
 
+  it('recovers when a waiting process exits while holding the distributed lock', async () => {
+    const lockTTL = 200;
+    const workerScript = path.join(__dirname, 'helpers', 'distributed-lock-holder.ts');
+    const holder = fork(workerScript, {
+      env: {
+        ...process.env,
+        REDIS_URL: redisUrl,
+        LOCK_TTL: String(lockTTL),
+        LOCK_EXTEND_INTERVAL: '0',
+      },
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+      execArgv: [...process.execArgv, '-r', registerPath],
+    });
+
+    const queue = createMessageQueue(holder);
+    const isReadyMessage = (message: unknown): message is { type: 'ready' } =>
+      isTypedMessage(message, 'ready');
+    const isAcquiredMessage = (message: unknown): message is { type: 'acquired'; id: string } =>
+      isTypedMessage(message, 'acquired') && typeof message.id === 'string';
+
+    await queue.waitFor(isReadyMessage);
+
+    holder.send({ type: 'acquire', id: 'crash-lock' });
+    await queue.waitFor(isAcquiredMessage, 5_000);
+
+    const manager = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      lockTTL,
+      lockExtendInterval: 0,
+    });
+
+    try {
+      const start = Date.now();
+      const resultPromise = manager.runOperation('crash-lock', async () => Date.now());
+
+      await sleep(50);
+      holder.kill('SIGKILL');
+      await once(holder, 'exit');
+
+      const completionTime = await resultPromise;
+      const elapsed = completionTime - start;
+
+      expect(elapsed).toBeGreaterThanOrEqual(lockTTL);
+      expect(elapsed).toBeLessThan(4_000);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it('detects deadlocks spanning multiple managers across processes', async () => {
-    const registerPath = path.join(__dirname, 'helpers', 'register-ts.js');
     const workerScript = path.join(__dirname, 'helpers', 'distributed-deadlock-worker.ts');
 
     type ReadyMessage = { type: 'ready'; workerId: string };
