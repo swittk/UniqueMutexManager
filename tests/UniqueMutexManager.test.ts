@@ -1,4 +1,5 @@
 import { ChildProcessWithoutNullStreams, spawn, spawnSync, fork } from 'node:child_process';
+import * as fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import { randomInt } from 'node:crypto';
@@ -146,6 +147,15 @@ function createMessageQueue(child: ChildProcess) {
 
         if (predicate(nextMessage)) {
           return nextMessage;
+        }
+
+        // Check for worker-reported errors
+        if (
+          nextMessage &&
+          typeof nextMessage === 'object' &&
+          (nextMessage as any).type === 'error'
+        ) {
+          throw new Error(`Worker reported error: ${(nextMessage as any).error}`);
         }
 
         messages.push(nextMessage);
@@ -2371,7 +2381,7 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     const isShutdownCompleteMessage = (message: unknown): message is ShutdownCompleteMessage =>
       isTypedMessage(message, 'shutdown-complete') && typeof message.workerId === 'string';
 
-    const workerA = fork(workerScript, {
+    const workerA = fork(registerPath, [workerScript], {
       env: {
         ...process.env,
         REDIS_URL: redisUrl,
@@ -2380,10 +2390,10 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
         WORKER_LABEL: 'A',
       },
       stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-      execArgv: [...process.execArgv, '-r', registerPath],
+      // execArgv: [...process.execArgv, '-r', registerPath],
     });
 
-    const workerB = fork(workerScript, {
+    const workerB = fork(registerPath, [workerScript], {
       env: {
         ...process.env,
         REDIS_URL: redisUrl,
@@ -2392,7 +2402,7 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
         WORKER_LABEL: 'B',
       },
       stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-      execArgv: [...process.execArgv, '-r', registerPath],
+      // execArgv: [...process.execArgv, '-r', registerPath],
     });
 
     const queueA = createMessageQueue(workerA);
@@ -2875,7 +2885,7 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     const queues: ReturnType<typeof createMessageQueue>[] = [];
 
     for (let i = 0; i < workerCount; i++) {
-      const worker = fork(workerScript, {
+      const worker = fork(registerPath, [workerScript], {
         env: {
           ...process.env,
           REDIS_URL: redisUrl,
@@ -2884,7 +2894,7 @@ describeDistributed('Bulletproof Mutex Tests', () => {
           WORKER_ID: `worker-${i}`,
         },
         stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-        execArgv: [...process.execArgv, '-r', registerPath],
+        // execArgv: [...process.execArgv, '-r', registerPath],
       });
       workers.push(worker);
       queues.push(createMessageQueue(worker));
@@ -3065,3 +3075,947 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     await client.quit();
   }, 30_000);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stress Tests & Client Misuse Protection
+// ─────────────────────────────────────────────────────────────────────────────
+describe('Stress Tests & Client Misuse Protection', () => {
+  const redisUrl = 'redis://127.0.0.1:6380';
+  let redisProcess: ReturnType<typeof spawn>;
+
+  beforeAll(async () => {
+    redisProcess = spawn('redis-server', ['--port', '6380', '--save', '', '--appendonly', 'no'], {
+      stdio: 'ignore',
+    });
+    await new Promise((r) => setTimeout(r, 1000));
+  });
+
+  afterAll(async () => {
+    redisProcess?.kill();
+    await new Promise((r) => setTimeout(r, 500));
+  });
+
+  it('survives ultra-short TTL with random jitter', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 150, // Very aggressive: 150ms
+      lockExtendInterval: 40, // Extend every 40ms
+      coordinationClient: client,
+    });
+
+    const results: number[] = [];
+    let maxConcurrent = 0;
+    let concurrent = 0;
+
+    // 20 operations with random 10-80ms delays
+    const tasks = Array.from({ length: 20 }, (_, i) =>
+      manager.runOperation('ultra-short-ttl', async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        if (concurrent > 1) throw new Error(`Overlap detected! concurrent=${concurrent}`);
+        results.push(i);
+        await sleep(randomInt(10, 80));
+        concurrent--;
+        return i;
+      })
+    );
+
+    await Promise.all(tasks);
+
+    expect(maxConcurrent).toBe(1);
+    expect(results.length).toBe(20);
+
+    await client.quit();
+  }, 30_000);
+
+  it('handles operation running across multiple extension cycles', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 300, // Brutal: 300ms TTL
+      lockExtendInterval: 60, // Brutal: 60ms extension interval
+      coordinationClient: client,
+    });
+
+    // Operation runs 200ms, requiring ~3-4 extensions (at 60, 120, 180ms)
+    const result = await manager.runOperation('multi-extension-cycles', async () => {
+      await sleep(200);
+      return 'multi-cycle-success';
+    });
+
+    expect(result).toBe('multi-cycle-success');
+
+    await client.quit();
+  }, 10_000);
+
+  it('handles rapid lock reacquisition stress (100 cycles)', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 500,
+      lockExtendInterval: 100,
+      coordinationClient: client,
+    });
+
+    const cycles = 100;
+    const results: number[] = [];
+
+    for (let i = 0; i < cycles; i++) {
+      await manager.runOperation('rapid-reacquire', async () => {
+        results.push(i);
+      });
+    }
+
+    expect(results.length).toBe(cycles);
+    expect(results).toEqual(Array.from({ length: cycles }, (_, i) => i));
+
+    await client.quit();
+  }, 60_000);
+
+  it('detects reentrant forever-lock attempt via deadlock detection', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 5000,
+      lockExtendInterval: 1000,
+      coordinationClient: client,
+    });
+
+    // Attempt to create a deadlock: A -> B -> A
+    await expect(
+      manager.runOperation('mutex-A', async () => {
+        await manager.runOperation('mutex-B', async () => {
+          // This should trigger deadlock detection if another context tries A while we hold B
+          // For self-deadlock, we need different contexts
+          // In same context, this is reentrant which is allowed
+          return 'nested';
+        });
+        return 'outer';
+      })
+    ).resolves.toBe('outer'); // Reentrant on different IDs is fine
+
+    // True deadlock requires different contexts - test that deadlock detection works
+    const manager2 = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 5000,
+      lockExtendInterval: 1000,
+      coordinationClient: client,
+    });
+
+    // Create a deadlock scenario where manager1 holds A, waits for B
+    // and manager2 holds B, waits for A
+    const deadlockPromise = Promise.all([
+      manager.runOperation('deadlock-A', async () => {
+        await sleep(50); // Let manager2 acquire B first
+        return manager.runOperation('deadlock-B', async () => 'manager1-got-B', {
+          timeoutMs: 2000,
+        });
+      }),
+      manager2.runOperation('deadlock-B', async () => {
+        await sleep(50); // Let manager1 acquire A first
+        return manager2.runOperation('deadlock-A', async () => 'manager2-got-A', {
+          timeoutMs: 2000,
+        });
+      }),
+    ]);
+
+    // One of them should detect deadlock or timeout
+    await expect(deadlockPromise).rejects.toThrow();
+
+    await client.quit();
+  }, 30_000);
+
+  it('releases lock even when client ignores abort signal', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 2000,
+      lockExtendInterval: 500,
+      coordinationClient: client,
+    });
+
+    const abortController = new AbortController();
+    let operationStarted = false;
+    let operationCompleted = false;
+
+    const operationPromise = manager.runOperation(
+      'ignore-abort',
+      async ({ abortSignal }) => {
+        operationStarted = true;
+        // Client ignores abort signal and continues working
+        await sleep(500);
+        // Even though aborted, we check if we can still complete
+        operationCompleted = !abortSignal.aborted;
+        return 'completed';
+      },
+      { signal: abortController.signal }
+    );
+
+    await sleep(100);
+    abortController.abort('User cancelled');
+
+    // Operation should be aborted
+    await expect(operationPromise).rejects.toThrow();
+    expect(operationStarted).toBe(true);
+
+    // Lock should be released - next operation should succeed quickly
+    const start = Date.now();
+    const nextResult = await manager.runOperation('ignore-abort', async () => 'next-success');
+    const elapsed = Date.now() - start;
+
+    expect(nextResult).toBe('next-success');
+    expect(elapsed).toBeLessThan(500); // Should acquire quickly, not wait for TTL
+
+    await client.quit();
+  }, 10_000);
+
+  it('handles operation that never completes when extension fails', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+
+    // Configure redlock with aggressive retry settings
+    const customRedlock = new Redlock([client], {
+      retryCount: 3,
+      retryDelay: 50,
+    });
+
+    // Mock extension to fail after 2 successful extensions
+    let extensionAttempts = 0;
+    const originalAcquire = customRedlock.acquire.bind(customRedlock);
+    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
+      const lock = await originalAcquire(...args);
+      lock.extend = async function (duration: number) {
+        extensionAttempts++;
+        if (extensionAttempts > 2) {
+          throw new Error('Simulated extension failure - connection lost');
+        }
+        // @ts-ignore - update expiration manually for the mock
+        lock.expiration = Date.now() + duration;
+        return lock;
+      };
+      return lock;
+    };
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 200, // Brutal: 200ms TTL
+      lockExtendInterval: 50, // Brutal: 50ms extension interval
+      coordinationClient: client,
+    });
+
+    // Start an operation that hangs forever
+    let operationAborted = false;
+    const hangingPromise = manager.runOperation('extension-fails', async () => {
+      try {
+        await new Promise(() => { }); // Never resolves
+      } catch {
+        operationAborted = true;
+      }
+    }).catch(() => {
+      // Operation will fail due to extension failure
+    });
+
+    // Wait for extension failures to trigger (3 consecutive failures after 2 successes)
+    // At 50ms interval: 50ms (success), 100ms (success), 150ms (fail), 200ms (fail), 250ms (fail)
+    await sleep(400);
+
+    // Another manager should be able to acquire the lock now
+    const client2 = new IORedis(redisUrl);
+    const customRedlock2 = new Redlock([client2], {
+      retryCount: 5,
+      retryDelay: 100,
+    });
+
+    const manager2 = new UniqueMutexManager({
+      redlock: customRedlock2,
+      lockTTL: 500,
+      lockExtendInterval: 100,
+      coordinationClient: client2,
+    });
+
+    // This should succeed after the first manager's extensions fail
+    const result = await manager2.runOperation('extension-fails', async () => 'recovered', {
+      timeoutMs: 3000,
+    });
+
+    expect(result).toBe('recovered');
+    expect(extensionAttempts).toBeGreaterThanOrEqual(3); // At least 2 success + 1 fail
+
+    await client.quit();
+    await client2.quit();
+  }, 15_000);
+
+  it('throws error for invalid mutex IDs', async () => {
+    const manager = new UniqueMutexManager();
+
+    // Empty string
+    await expect(
+      manager.runOperation('', async () => 'should-fail')
+    ).rejects.toThrow();
+
+    // Whitespace only
+    await expect(
+      manager.runOperation('   ', async () => 'should-fail')
+    ).rejects.toThrow();
+  });
+
+  it('throws error for null/undefined operation callbacks', async () => {
+    const manager = new UniqueMutexManager();
+
+    // @ts-expect-error - Testing runtime behavior with invalid input
+    await expect(manager.runOperation('valid-id', null)).rejects.toThrow();
+
+    // @ts-expect-error - Testing runtime behavior with invalid input
+    await expect(manager.runOperation('valid-id', undefined)).rejects.toThrow();
+  });
+
+  it('reentrant lock is properly released when inner operation throws', async () => {
+    const manager = new UniqueMutexManager();
+
+    // Inner throws but outer should still release the lock properly
+    await expect(
+      manager.runOperation('reentrant-throw', async () => {
+        await manager.runOperation('reentrant-throw', async () => {
+          throw new Error('Inner operation failed');
+        });
+      })
+    ).rejects.toThrow('Inner operation failed');
+
+    // Lock should be released - next operation should succeed immediately
+    const start = Date.now();
+    const result = await manager.runOperation('reentrant-throw', async () => 'recovered');
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('recovered');
+    expect(elapsed).toBeLessThan(50); // Should be near-instant, not stuck
+  });
+
+  it('deeply nested reentrant (5 levels) with error in middle releases all locks', async () => {
+    const manager = new UniqueMutexManager();
+    const sequence: string[] = [];
+
+    // 5 levels deep, error at level 3
+    await expect(
+      manager.runOperation('deep-nest', async () => {
+        sequence.push('L1-enter');
+        try {
+          await manager.runOperation('deep-nest', async () => {
+            sequence.push('L2-enter');
+            try {
+              await manager.runOperation('deep-nest', async () => {
+                sequence.push('L3-enter');
+                try {
+                  await manager.runOperation('deep-nest', async () => {
+                    sequence.push('L4-enter');
+                    try {
+                      await manager.runOperation('deep-nest', async () => {
+                        sequence.push('L5-enter');
+                        throw new Error('Error at level 5');
+                      });
+                    } finally {
+                      sequence.push('L4-finally');
+                    }
+                  });
+                } finally {
+                  sequence.push('L3-finally');
+                }
+              });
+            } finally {
+              sequence.push('L2-finally');
+            }
+          });
+        } finally {
+          sequence.push('L1-finally');
+        }
+      })
+    ).rejects.toThrow('Error at level 5');
+
+    // Verify all levels ran their finally blocks
+    expect(sequence).toEqual([
+      'L1-enter', 'L2-enter', 'L3-enter', 'L4-enter', 'L5-enter',
+      'L4-finally', 'L3-finally', 'L2-finally', 'L1-finally',
+    ]);
+
+    // Lock should be fully released
+    const result = await manager.runOperation('deep-nest', async () => 'fully-recovered');
+    expect(result).toBe('fully-recovered');
+  });
+
+  it('reentrant with distributed lock recovers after extension failure', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    // Mock extension to fail immediately
+    let extensionCount = 0;
+    const originalAcquire = customRedlock.acquire.bind(customRedlock);
+    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
+      const lock = await originalAcquire(...args);
+      lock.extend = async function () {
+        extensionCount++;
+        throw new Error('Simulated extension failure');
+      };
+      return lock;
+    };
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 200,
+      lockExtendInterval: 50,
+      coordinationClient: client,
+    });
+
+    // Run a reentrant operation - outer acquires distributed lock
+    // Inner is reentrant (same lock), extension fails, but should still work
+    // because reentrant doesn't need to re-acquire
+    let innerCompleted = false;
+    try {
+      await manager.runOperation('reentrant-ext-fail', async () => {
+        // Reentrant call - uses parent's lock
+        await manager.runOperation('reentrant-ext-fail', async () => {
+          innerCompleted = true;
+        });
+        // Wait long enough for extension to try (and fail)
+        await sleep(100);
+      });
+    } catch {
+      // Extension failure may abort the operation - that's fine
+    }
+
+    // Inner should have completed (reentrant doesn't need extension)
+    expect(innerCompleted).toBe(true);
+    expect(extensionCount).toBeGreaterThanOrEqual(1);
+
+    await client.quit();
+  }, 10_000);
+
+  it('nightmare: distributed + nested reentrant A→B→A + 500ms+ latency', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client]);
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 3000, // 3s TTL to handle latency
+      lockExtendInterval: 500, // Extend every 500ms
+      coordinationClient: client,
+    });
+
+    const sequence: string[] = [];
+    let maxConcurrentA = 0;
+    let currentConcurrentA = 0;
+
+    // Simulate 500ms+ latency in operations
+    const simulateLatency = () => sleep(randomInt(500, 800));
+
+    // Pattern: lockA → lockB → lockA (nested reentrant back to A)
+    const result = await manager.runOperation('nightmare-A', async ({ heldMutexIds }) => {
+      currentConcurrentA++;
+      maxConcurrentA = Math.max(maxConcurrentA, currentConcurrentA);
+      sequence.push(`A1-enter:${heldMutexIds.join(',')}`);
+
+      await simulateLatency(); // 500-800ms latency
+
+      // Now acquire B while holding A
+      const innerResult = await manager.runOperation('nightmare-B', async ({ heldMutexIds: bHeld }) => {
+        sequence.push(`B-enter:${bHeld.join(',')}`);
+
+        await simulateLatency(); // More latency
+
+        // Now reentrant back to A while holding both A and B
+        const deepResult = await manager.runOperation('nightmare-A', async ({ heldMutexIds: aHeld }) => {
+          sequence.push(`A2-enter:${aHeld.join(',')}`);
+          expect(aHeld).toContain('nightmare-A');
+          expect(aHeld).toContain('nightmare-B');
+
+          await simulateLatency(); // Even more latency
+
+          sequence.push('A2-exit');
+          return 'deepest';
+        });
+
+        sequence.push('B-exit');
+        return `B-got-${deepResult}`;
+      });
+
+      currentConcurrentA--;
+      sequence.push('A1-exit');
+      return `A-got-${innerResult}`;
+    });
+
+    expect(result).toBe('A-got-B-got-deepest');
+    expect(maxConcurrentA).toBe(1); // Never had concurrent A locks
+    expect(sequence).toEqual([
+      'A1-enter:nightmare-A',
+      'B-enter:nightmare-A,nightmare-B',
+      'A2-enter:nightmare-A,nightmare-B', // Reentrant A sees both locks
+      'A2-exit',
+      'B-exit',
+      'A1-exit',
+    ]);
+
+    // Verify locks are fully released - next operation should work immediately
+    const start = Date.now();
+    const verification = await manager.runOperation('nightmare-A', async () => 'clean-slate');
+    const elapsed = Date.now() - start;
+
+    expect(verification).toBe('clean-slate');
+    expect(elapsed).toBeLessThan(100); // Should be near-instant
+
+    await client.quit();
+  }, 30_000);
+
+  it('nightmare: two managers racing with nested locks + latency', async () => {
+    const client1 = new IORedis(redisUrl);
+    const client2 = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const redlock1 = new Redlock([client1]);
+    const redlock2 = new Redlock([client2]);
+
+    const manager1 = new UniqueMutexManager({
+      redlock: redlock1,
+      lockTTL: 2000,
+      lockExtendInterval: 400,
+      coordinationClient: client1,
+    });
+
+    const manager2 = new UniqueMutexManager({
+      redlock: redlock2,
+      lockTTL: 2000,
+      lockExtendInterval: 400,
+      coordinationClient: client2,
+    });
+
+    const sequence: string[] = [];
+    let overlap = false;
+    let currentHolder: string | null = null;
+
+    const runWithLatency = async (name: string, manager: UniqueMutexManager) => {
+      return manager.runOperation('shared-lock', async () => {
+        if (currentHolder !== null) {
+          overlap = true;
+          throw new Error(`Overlap! ${name} entered while ${currentHolder} holds lock`);
+        }
+        currentHolder = name;
+        sequence.push(`${name}-enter`);
+
+        // Nested reentrant
+        await manager.runOperation('shared-lock', async () => {
+          sequence.push(`${name}-nested`);
+          await sleep(randomInt(300, 600)); // Latency
+        });
+
+        await sleep(randomInt(200, 400)); // More latency
+
+        sequence.push(`${name}-exit`);
+        currentHolder = null;
+        return name;
+      }, { timeoutMs: 10_000 });
+    };
+
+    // Race both managers
+    const [result1, result2] = await Promise.all([
+      runWithLatency('M1', manager1),
+      runWithLatency('M2', manager2),
+    ]);
+
+    expect(overlap).toBe(false);
+    expect([result1, result2].sort()).toEqual(['M1', 'M2']);
+
+    // Verify sequence shows no overlap
+    const enterExitPairs: string[] = [];
+    for (const entry of sequence) {
+      if (entry.includes('enter') || entry.includes('exit')) {
+        enterExitPairs.push(entry);
+      }
+    }
+    // Should be M1-enter...M1-exit, M2-enter...M2-exit or vice versa
+    const m1EnterIdx = enterExitPairs.indexOf('M1-enter');
+    const m1ExitIdx = enterExitPairs.indexOf('M1-exit');
+    const m2EnterIdx = enterExitPairs.indexOf('M2-enter');
+    const m2ExitIdx = enterExitPairs.indexOf('M2-exit');
+
+    // M1 should complete before M2 starts, or vice versa
+    const m1BeforeM2 = m1ExitIdx < m2EnterIdx;
+    const m2BeforeM1 = m2ExitIdx < m1EnterIdx;
+    expect(m1BeforeM2 || m2BeforeM1).toBe(true);
+
+    await client1.quit();
+    await client2.quit();
+  }, 30_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRUE MULTI-PROCESS NIGHTMARE TESTS (IPC coordination, Redis overlap detection)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('True Multi-Process Nightmare Tests', () => {
+  const redisUrl = 'redis://127.0.0.1:6380';
+  let redisProcess: ReturnType<typeof spawn>;
+  let coordClient: InstanceType<typeof IORedis>;
+  const registerPath = path.join(__dirname, 'helpers', 'register-ts.js');
+  const workerScript = path.join(__dirname, 'helpers', 'nightmare-worker.ts');
+
+  beforeAll(async () => {
+    redisProcess = spawn('redis-server', ['--port', '6380', '--save', '', '--appendonly', 'no'], {
+      stdio: 'inherit',
+    });
+    await new Promise((r) => setTimeout(r, 1000));
+    coordClient = new IORedis(redisUrl);
+  });
+
+  afterAll(async () => {
+    await coordClient?.quit();
+    redisProcess?.kill();
+    await new Promise((r) => setTimeout(r, 500));
+  });
+
+  interface OperationRecord {
+    workerId: string;
+    lockId: string;
+    phase: 'enter' | 'exit';
+    timestamp: number;
+  }
+
+  const cleanupCoordKeys = async (coordKey: string) => {
+    await coordClient.del(`${coordKey}:log`);
+    await coordClient.del(`${coordKey}:errors`);
+    await coordClient.del(`${coordKey}:debug`);
+  };
+
+  const getOperationLog = async (coordKey: string): Promise<OperationRecord[]> => {
+    const logs = await coordClient.lrange(`${coordKey}:log`, 0, -1);
+    return logs.map((l) => JSON.parse(l) as OperationRecord);
+  };
+
+  const checkForOverlap = (log: OperationRecord[], lockId: string): boolean => {
+    const events = log.filter((r) => r.lockId === lockId);
+    let currentHolder: string | null = null;
+
+    for (const event of events) {
+      if (event.phase === 'enter') {
+        if (currentHolder !== null && currentHolder !== event.workerId) {
+          return true; // Overlap detected
+        }
+        currentHolder = event.workerId;
+      } else if (event.phase === 'exit') {
+        if (currentHolder === event.workerId) {
+          currentHolder = null;
+        }
+      }
+    }
+    return false;
+  };
+
+  // IPC message type guards
+  const isReadyMessage = (msg: unknown): msg is { type: 'ready'; workerId: string } =>
+    isTypedMessage(msg, 'ready') && typeof (msg as Record<string, unknown>).workerId === 'string';
+
+  const isCompleteMessage = (msg: unknown): msg is { type: 'complete'; workerId: string } =>
+    isTypedMessage(msg, 'complete') && typeof (msg as Record<string, unknown>).workerId === 'string';
+
+  it('true multi-process: 3 workers racing with 500ms+ latency', async () => {
+    const coordKey = 'nightmare-race-test';
+    const workerCount = 3;
+
+    await cleanupCoordKeys(coordKey);
+
+    const workers: ChildProcess[] = [];
+    const queues: ReturnType<typeof createMessageQueue>[] = [];
+
+    // Spawn workers with IPC
+    for (let i = 0; i < workerCount; i++) {
+      const worker = fork(registerPath, [workerScript], {
+        env: {
+          ...process.env,
+          REDIS_URL: redisUrl,
+          WORKER_ID: `worker-${i}`,
+          LOCK_PATTERN: 'single',
+          OPERATION_LATENCY: '500',
+          COORD_KEY: coordKey,
+        },
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+      });
+      workers.push(worker);
+      queues.push(createMessageQueue(worker));
+      worker.send({ type: 'ping' });
+    }
+
+    try {
+      // Wait for all workers to be ready via IPC
+      await Promise.all(queues.map((q) => q.waitFor(isReadyMessage, 30_000)));
+
+      // Start all workers simultaneously
+      for (const worker of workers) {
+        worker.send({ type: 'start' });
+      }
+
+      // Wait for all to complete via IPC
+      await Promise.all(queues.map((q) => q.waitFor(isCompleteMessage, 30_000)));
+
+      // Check for overlap via Redis logs
+      const log = await getOperationLog(coordKey);
+      expect(log.length).toBeGreaterThanOrEqual(workerCount * 2);
+
+      const hasOverlap = checkForOverlap(log, 'nightmare-mutex');
+      expect(hasOverlap).toBe(false);
+
+      // Check for errors
+      const errors = await coordClient.lrange(`${coordKey}:errors`, 0, -1);
+      expect(errors.length).toBe(0);
+    } finally {
+      for (const worker of workers) {
+        worker.kill();
+      }
+      await cleanupCoordKeys(coordKey);
+    }
+  }, 60_000);
+
+  it('true multi-process: 2 workers with nested A→B→A pattern + 500ms+ latency', async () => {
+    const coordKey = 'nightmare-nested-test';
+    const workerCount = 2;
+
+    await cleanupCoordKeys(coordKey);
+
+    const workers: ChildProcess[] = [];
+    const queues: ReturnType<typeof createMessageQueue>[] = [];
+
+    // Spawn workers with nested lock pattern
+    for (let i = 0; i < workerCount; i++) {
+      const worker = fork(registerPath, [workerScript], {
+        env: {
+          ...process.env,
+          REDIS_URL: redisUrl,
+          WORKER_ID: `nested-worker-${i}`,
+          LOCK_PATTERN: 'nested-aba',
+          OPERATION_LATENCY: '500',
+          COORD_KEY: coordKey,
+        },
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+      });
+      workers.push(worker);
+      queues.push(createMessageQueue(worker));
+      worker.send({ type: 'ping' });
+    }
+
+    try {
+      // Wait for all workers to be ready via IPC
+      await Promise.all(queues.map((q) => q.waitFor(isReadyMessage, 30_000)));
+
+      // Start all workers simultaneously
+      for (const worker of workers) {
+        worker.send({ type: 'start' });
+      }
+
+      // Wait for all to complete via IPC (longer timeout for nested)
+      await Promise.all(queues.map((q) => q.waitFor(isCompleteMessage, 60_000)));
+
+      // Check for overlap via Redis logs
+      const log = await getOperationLog(coordKey);
+
+      // Each worker: A-enter, B-enter, A-reentrant-enter, A-reentrant-exit, B-exit, A-exit = 6 events
+      expect(log.length).toBeGreaterThanOrEqual(workerCount * 6);
+
+      // Check no overlap on outer A lock
+      const hasOverlapA = checkForOverlap(log, 'nightmare-A');
+      expect(hasOverlapA).toBe(false);
+
+      // Check no overlap on B lock
+      const hasOverlapB = checkForOverlap(log, 'nightmare-B');
+      expect(hasOverlapB).toBe(false);
+
+      // Check for errors
+      const errors = await coordClient.lrange(`${coordKey}:errors`, 0, -1);
+      expect(errors.length).toBe(0);
+    } finally {
+      for (const worker of workers) {
+        worker.kill();
+      }
+      await cleanupCoordKeys(coordKey);
+    }
+  }, 90_000);
+
+  it('true multi-process: crash & recovery - worker dies holding lock, another recovers it', async () => {
+    const coordKey = 'nightmare-crash-test';
+    await cleanupCoordKeys(coordKey);
+
+    const workers: ChildProcess[] = [];
+    const queues: ReturnType<typeof createMessageQueue>[] = [];
+
+    // 1. Spawn Victim Worker
+    const victim = fork(registerPath, [workerScript], {
+      env: {
+        ...process.env,
+        REDIS_URL: redisUrl,
+        WORKER_ID: 'victim',
+        LOCK_PATTERN: 'crash-victim',
+        COORD_KEY: coordKey,
+      },
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      // execArgv: [...process.execArgv, '-r', registerPath],
+    });
+    const victimQueue = createMessageQueue(victim);
+    // Wait for victim to be ready with ping retry
+    const victimPing = setInterval(() => {
+      if (victim.connected) victim.send({ type: 'ping' });
+    }, 1000);
+
+    await victimQueue.waitFor(isReadyMessage, 30_000).finally(() => clearInterval(victimPing));
+    console.log('Victim ready!');
+
+    try {
+      victim.send({ type: 'start' });
+
+      // Wait for victim to acquire lock and signal readiness to crash
+      await victimQueue.waitFor(
+        (msg: unknown): msg is { type: 'ready-to-crash'; workerId: string } =>
+          isTypedMessage(msg, 'ready-to-crash'),
+        20_000
+      );
+
+      // Verify lock is held by checking Redis logs
+      const logBeforeCrash = await getOperationLog(coordKey);
+      expect(logBeforeCrash).toHaveLength(1);
+      expect(logBeforeCrash[0].workerId).toBe('victim');
+      expect(logBeforeCrash[0].phase).toBe('enter');
+
+      // 2. KILL THE VICTIM (Simulate hard crash)
+      victim.kill('SIGKILL');
+      await new Promise((r) => setTimeout(r, 100)); // Ensure it's dead
+
+      // 3. Spawn Recovery Worker
+      // It should block until TTL expires (approx 3s), then acquire lock
+      const recovery = fork(registerPath, [workerScript], {
+        env: {
+          ...process.env,
+          REDIS_URL: redisUrl,
+          WORKER_ID: 'recovery',
+          LOCK_PATTERN: 'crash-recovery',
+          COORD_KEY: coordKey,
+        },
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+        // execArgv: [...process.execArgv, '-r', registerPath],
+      });
+      recovery.on('exit', (c, s) => console.log(`Recovery exited: ${c} ${s}`));
+      const recoveryQueue = createMessageQueue(recovery);
+      const recoveryPing = setInterval(() => recovery.send({ type: 'ping' }), 500);
+      workers.push(recovery); // Track for cleanup
+
+      await recoveryQueue.waitFor(isReadyMessage, 30_000).finally(() => clearInterval(recoveryPing));
+      recovery.send({ type: 'start' });
+
+      // Wait for recovery completion (should succeed after TTL)
+      await recoveryQueue.waitFor(isCompleteMessage, 300_000);
+
+      // Verify log history
+      const logAfter = await getOperationLog(coordKey);
+
+      // Expected: 
+      // 1. Victim enter
+      // 2. Recovery enter (after delay)
+      // 3. Recovery exit
+      expect(logAfter).toHaveLength(3);
+      expect(logAfter[0].workerId).toBe('victim');
+      expect(logAfter[1].workerId).toBe('recovery');
+      expect(logAfter[1].timestamp - logAfter[0].timestamp).toBeGreaterThan(2000); // At least TTL
+
+      // Check for errors
+      const errors = await coordClient.lrange(`${coordKey}:errors`, 0, -1);
+      expect(errors.length).toBe(0);
+
+    } finally {
+      victim.kill('SIGKILL'); // Ensure dead
+      for (const worker of workers) {
+        worker.kill();
+      }
+      await cleanupCoordKeys(coordKey);
+    }
+  }, 300_000);
+
+  it('true multi-process: 5 workers with Deep Nested ABCAB pattern + latency', async () => {
+    const coordKey = 'nightmare-deep-nested';
+    const workerCount = 5;
+
+    await cleanupCoordKeys(coordKey);
+
+    const workers: ChildProcess[] = [];
+    const queues: ReturnType<typeof createMessageQueue>[] = [];
+
+    // Spawn workers with deep nested pattern
+    for (let i = 0; i < workerCount; i++) {
+      const worker = fork(registerPath, [workerScript], {
+        env: {
+          ...process.env,
+          REDIS_URL: redisUrl,
+          WORKER_ID: `abcab-worker-${i}`,
+          LOCK_PATTERN: 'nested-abcab',
+          OPERATION_LATENCY: '500',
+          COORD_KEY: coordKey,
+        },
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+        // execArgv: [...process.execArgv, '-r', registerPath],
+      });
+      workers.push(worker);
+      queues.push(createMessageQueue(worker));
+      (worker as any).pingInterval = setInterval(() => {
+        if (worker.connected) worker.send({ type: 'ping' });
+      }, 500);
+    }
+
+    try {
+      // Wait for all workers to be ready via IPC
+      await Promise.all(queues.map((q) => q.waitFor(isReadyMessage, 30_000)));
+
+      // Clear ping intervals
+      for (const worker of workers) {
+        clearInterval((worker as any).pingInterval);
+      }
+
+      // Start all workers simultaneously
+      for (const worker of workers) {
+        worker.send({ type: 'start' });
+      }
+
+      // Wait for all to complete via IPC
+      // A->B->C->A->B is 5 phases per worker. 5 workers * 5 phases * 500ms = ~12.5s min sequential time
+      // But with overhead and contention, give it plenty of time.
+      await Promise.all(queues.map((q) => q.waitFor(isCompleteMessage, 300_000)));
+
+      // Check for overlap via Redis logs
+      const log = await getOperationLog(coordKey);
+
+      // Each worker: A, B, C, A-re, B-re (enter+exit = 10 events)
+      expect(log.length).toBeGreaterThanOrEqual(workerCount * 10);
+
+      // Verify mutual exclusivity for all locks
+      expect(checkForOverlap(log, 'nightmare-A')).toBe(false);
+      expect(checkForOverlap(log, 'nightmare-B')).toBe(false);
+      expect(checkForOverlap(log, 'nightmare-C')).toBe(false);
+
+      // Check for errors
+      const errors = await coordClient.lrange(`${coordKey}:errors`, 0, -1);
+      expect(errors.length).toBe(0);
+    } finally {
+      for (const worker of workers) {
+        worker.kill();
+      }
+      await cleanupCoordKeys(coordKey);
+    }
+  }, 300_000);
+});
+

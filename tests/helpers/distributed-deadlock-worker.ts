@@ -43,7 +43,7 @@ function waitForProceedSignal(): Promise<void> {
 
 async function runCycle(): Promise<void> {
   try {
-    const result = await manager.runOperation(primaryId, async () => {
+    const result = await manager.runOperation(primaryId!, async () => {
       process.send?.({
         type: 'outer-started',
         workerId,
@@ -53,7 +53,7 @@ async function runCycle(): Promise<void> {
       await waitForProceedSignal();
 
       try {
-        const nestedResult = await manager.runOperation(nestedId, async () => `${primaryId}->${nestedId}`);
+        const nestedResult = await manager.runOperation(nestedId!, async () => `${primaryId}->${nestedId}`);
         process.send?.({
           type: 'nested-result',
           workerId,

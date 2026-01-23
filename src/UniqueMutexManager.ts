@@ -20,6 +20,10 @@ import {
 import { generateInstanceId } from './id';
 import { importOptionalModule, loadOptionalModule } from './moduleLoader';
 
+// This library is designed to be environment-agnostic.
+// Optional dependencies (ioredis, redlock) and Node-specific APIs (node:async_hooks, node:crypto)
+// are handled gracefully with fallbacks, making it suitable for use in Browsers and React Native.
+
 export type OperationType<T = unknown> = (args: {
   requestTime: number;
   startTime: number;
@@ -156,6 +160,8 @@ export class UniqueMutexManager {
   constructor(options: UniqueMutexManagerOptions = {}) {
     this.context = createFallbackAsyncLocalStorage<OperationContext>();
     this.supportsAsyncContext = false;
+    // Attempt to load Node's AsyncLocalStorage, falling back to a stack-based
+    // implementation for non-Node environments (Browsers, React Native).
     this.contextReady = createAsyncLocalStorage<OperationContext>()
       .then(({ storage, supportsAsync }) => {
         this.context = storage;
@@ -310,7 +316,8 @@ export class UniqueMutexManager {
 
   private async acquireDistributedLock(
     id: string,
-    waitIfLocked: boolean
+    waitIfLocked: boolean,
+    timeoutMs?: number
   ): Promise<DistributedLockHandle> {
     const redlock = await this.ensureRedlock();
     if (!redlock) {
@@ -318,7 +325,17 @@ export class UniqueMutexManager {
     }
 
     const resource = `uniquemutex:${id}`;
-    const settings = waitIfLocked ? undefined : { retryCount: 0 };
+    let settings: Partial<RedlockSettings> | undefined;
+
+    if (!waitIfLocked) {
+      settings = { retryCount: 0 };
+    } else if (timeoutMs !== undefined && timeoutMs > 0) {
+      // Redlock v5 uses a nested settings object for its configuration.
+      // We calculate retryCount based on the configured retryDelay to respect the user's timeout.
+      const retryDelay = (redlock as any).settings?.retryDelay || 200;
+      const retryCount = Math.ceil(timeoutMs / retryDelay);
+      settings = { retryCount };
+    }
 
     try {
       const lock = await redlock.acquire([resource], this.lockTTL, settings);
@@ -333,8 +350,15 @@ export class UniqueMutexManager {
       };
       const timer = this.createLockExtension(lock, id, handle);
       return handle;
-    } catch (error) {
-      if (isResourceLockedError(error) || (!waitIfLocked && isExecutionError(error))) {
+    } catch (error: any) {
+      if (isResourceLockedError(error) || isExecutionError(error)) {
+        if (!waitIfLocked) {
+          throw new MutexLockedError(id, `Distributed mutex with id "${id}" is already locked`);
+        }
+        if (timeoutMs !== undefined && timeoutMs > 0) {
+          throw new MutexTimeoutError(id, timeoutMs);
+        }
+        // Fallback for cases where it's just locked but no specific timeout was hit (e.g. Redlock exhausted its own retries)
         throw new MutexLockedError(id, `Distributed mutex with id "${id}" is already locked`);
       }
       throw new DistributedLockError(
@@ -361,10 +385,14 @@ export class UniqueMutexManager {
     const maxConsecutiveFailures = 3;
     let consecutiveFailures = 0;
 
+    // Track the current lock instance. In Redlock v5, Lock objects are immutable
+    // and .extend() returns a new instance. We must use the latest instance
+    // for subsequent extensions and expiration checks.
+    let currentLock = lock;
     const interval = setInterval(async () => {
+      const now = Date.now();
       // STRICT CHECK 1: If lock has already expired, we must abort immediately
-      // This prevents overlap if we're in a retry loop but time has run out
-      if (Date.now() >= lock.expiration) {
+      if (now >= currentLock.expiration) {
         handle.extensionFailed = true;
         const expiryError = new LockExtensionError(id,
           `Lock for mutex "${id}" has expired (local time > expiration). Aborting immediately to prevent overlap.`
@@ -378,13 +406,18 @@ export class UniqueMutexManager {
       }
 
       try {
-        await lock.extend(this.lockTTL);
+        // Use currentLock.extend to ensure we are extending the most recent version of the lock
+        const extendedLock = await currentLock.extend(this.lockTTL);
+        if (extendedLock) {
+          currentLock = extendedLock;
+        }
         consecutiveFailures = 0; // Reset on success
       } catch (error) {
         consecutiveFailures++;
 
+        const currentNow = Date.now();
         // STRICT CHECK 2: Even if we have retries left, if we are now expired, we must abort.
-        if (Date.now() >= lock.expiration) {
+        if (currentNow >= currentLock.expiration) {
           consecutiveFailures = maxConsecutiveFailures + 1; // Force failure logic below
         }
 
@@ -461,6 +494,14 @@ export class UniqueMutexManager {
       onAbort?: (abort: (reason?: unknown) => void) => void;
     }
   ): Promise<T> {
+    // Input validation - fail fast for client misuse
+    if (!id || typeof id !== 'string' || id.trim().length === 0) {
+      throw new Error(`Invalid mutex ID: "${id}". ID must be a non-empty string.`);
+    }
+    if (typeof operation !== 'function') {
+      throw new Error(`Invalid operation callback: expected function, got ${typeof operation}.`);
+    }
+
     await this.contextReady;
 
     const waitPreference = opts?.waitIfLocked ?? true;
@@ -731,7 +772,7 @@ export class UniqueMutexManager {
             }
 
             try {
-              distributedLock = await this.acquireDistributedLock(id, canWait);
+              distributedLock = await this.acquireDistributedLock(id, canWait, timeoutMs);
             } catch (error) {
               if (timeoutError && error instanceof MutexLockedError) {
                 throw timeoutError;
