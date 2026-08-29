@@ -1,3 +1,7 @@
+/**
+ * @deprecated `waitIfLocked: false` now resolves to `undefined` on contention.
+ * Retained for source compatibility with 0.1.x consumers.
+ */
 export class MutexLockedError extends Error {
   public readonly id: string;
 
@@ -33,9 +37,12 @@ export class MutexAbortedError extends Error {
 }
 
 export class DistributedLockError extends Error {
-  constructor(message: string) {
+  public readonly cause: unknown;
+
+  constructor(message: string, cause?: unknown) {
     super(message);
     this.name = 'DistributedLockError';
+    this.cause = cause;
   }
 }
 

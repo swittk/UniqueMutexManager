@@ -11,9 +11,9 @@ npm install ioredis redlock
 ```
 
 The package publishes CommonJS and modern ES module builds along with bundled type declarations so it can run in Node.js,
-browser bundlers, workers, and other JavaScript runtimes. The compiled output targets ES2015 (ES6) to remain compatible with
-modern browsers while still supporting async/await semantics. Install the optional peer dependencies only when you plan to
-enable Redis-backed coordination.
+browser bundlers, workers, and other JavaScript runtimes. The compiled output targets ES2020. Local-only TypeScript consumers
+do not need `ioredis` or `redlock` installed just to resolve this package's declarations; install the optional peers only when
+you actually enable Redis-backed coordination.
 
 ## Usage
 
@@ -46,7 +46,7 @@ Operations wait indefinitely by default. If you prefer to fail fast without join
 await manager.runOperation('user:123', doWork, { waitIfLocked: false });
 ```
 
-A `MutexLockedError` will be thrown when the mutex is already occupied.
+If the mutex is already occupied, the call resolves to `undefined` and the callback is not executed. This behavior is identical for local and Redis-backed managers.
 
 To bound how long a caller waits before giving up, provide `timeoutMs` (in milliseconds). When the timeout expires a
 `MutexTimeoutError` is raised and the queued operation is cancelled before it executes:
@@ -106,8 +106,9 @@ const redlock = new Redlock(clients);
 
 const manager = new UniqueMutexManager({
   redlock,
-  lockTTL: 60000,
   coordinationClient: clients[0],
+  namespace: 'payments',
+  lockTTL: 60000,
 });
 ```
 
@@ -118,21 +119,66 @@ const manager = new UniqueMutexManager({
   redis: {
     urls: process.env.REDIS_URL!,
   },
+  namespace: 'payments',
 });
 ```
 
-Call `dispose()` when you are done to close any Redis clients that were created internally:
+For applications with many mutex managers, reuse externally owned Redis clients instead of opening one connection per manager:
+
+```ts
+const redis = new Redis(process.env.REDIS_URL!);
+
+const paymentMutexes = new UniqueMutexManager({
+  redis: { clients: [redis] },
+  namespace: 'payments',
+});
+const inventoryMutexes = new UniqueMutexManager({
+  redis: { clients: [redis] },
+  namespace: 'inventory',
+});
+```
+
+Externally supplied `redis.clients` are never closed by `dispose()`. URL-based clients, including clients returned by `redis.createClient`, are owned by the manager and are closed by `dispose()`. You can also share a single `Redlock` instance by passing `redlock` plus `coordinationClient`. Both `Redis` and `ioredis.Cluster` clients are supported; deadlock metadata uses independent single-key commands rather than a cross-slot Redis Cluster pipeline.
+
+Call `dispose()` when you are done to close only Redis clients that the manager owns:
 
 ```ts
 await manager.dispose();
 ```
 
-When Redis-backed locking is enabled, the manager also shares lock ownership metadata so that deadlock detection continues to
-work across process boundaries. If you supply your own Redlock instance, pass a Redis client via `coordinationClient` so that
-this metadata can be published. The `timeoutMs` option applies across distributed acquisitions as well; a waiting process throws
-`MutexTimeoutError` when its local timeout expires even if the mutex is still held by another instance.
+When Redis-backed locking is enabled, the manager can also share wait-for metadata so that deadlock detection continues across process boundaries. Metadata is published lazily only when a branch already holds a mutex and must wait for another one; ordinary uncontended acquisitions and top-level contention do not pay this coordination cost. Wait edges carry the exact ownership generation that existed when the wait began, so concurrent branches that reuse one manual context cannot create false cycles by acquiring or releasing unrelated locks later. New metadata lives under a disjoint `uniquemutex-meta-v2:*` prefix, so arbitrary legacy mutex ids cannot collide with it. For rolling upgrades, 0.2 still reads 0.1.x `owner`/`context` metadata as a fallback but does not write new metadata into that collision-prone legacy space. If you supply your own Redlock instance, pass a Redis client via `coordinationClient` to enable cross-process deadlock detection.
+
+Cross-process deadlock coordination is **strict by default**. If metadata cannot be published or read, a nested distributed wait fails with `DistributedLockError` rather than silently disabling deadlock protection. Set `coordinationFailureMode: 'best-effort'` when availability is more important and you accept temporarily losing cross-process cycle detection. Timeouts and abort signals also bound metadata I/O itself, so a hung coordination client cannot make a finite wait unbounded.
+
+Distributed acquisition always performs one bounded Redlock attempt at a time and owns the retry loop itself. With no `timeoutMs`, waiting is genuinely indefinite rather than being capped by Redlock's configured `retryCount`. Under contention it starts with a fast retry and exponentially backs off to the configured Redlock `retryDelay`, avoiding both ~200 ms handoff latency for short critical sections and a Redis hot loop under sustained contention. Redis/quorum failures are surfaced as `DistributedLockError` instead of being mistaken for normal contention.
+
+`namespace` creates a distinct distributed lock domain with encoded components under a separate `uniquemutex-v2:*` key prefix. Managers with the same namespace and mutex id coordinate; different namespaces do not, and namespaced keys cannot collide with arbitrary legacy 0.1.x ids. Omitting `namespace` preserves the legacy `uniquemutex:<id>` lock-key layout for rolling compatibility. For new multi-manager applications, explicit namespaces are recommended. Do not mix namespaced and legacy managers for one logical lock domain because they intentionally use different Redis keys.
+
+Automatic lease extension requires a positive `lockTTL` and, when enabled, a positive `lockExtendInterval` shorter than the TTL. Extension attempts are serialized and use single bounded Redlock attempts so a generic Redlock retry window cannot run past the current lease deadline. If lease ownership is lost, `abortSignal` is aborted and `assertLock()` throws `LockExtensionError`. Long-running work should check `abortSignal` or call `assertLock()` between irreversible steps.
+
+A distributed mutex is a lease, not a database transaction or fencing mechanism. Persistent uniqueness, money, inventory, and other durable invariants should still use database constraints, compare-and-set/version checks, idempotency keys, or another authoritative persistence-layer guard where appropriate.
+
+## 0.2 migration notes
+
+- Upgrade distributed users from 0.1.5 before enabling multi-instance locking. 0.1.5 did not retain the immutable replacement lock returned by Redlock v5 extension, which could allow a long-running lease to overlap another owner after the original TTL.
+- `waitIfLocked: false` now has one contract everywhere: the callback is skipped and the promise resolves to `undefined` on contention. `MutexLockedError` remains exported only for source compatibility.
+- Omitting `namespace` preserves the legacy `uniquemutex:<id>` **lock** resource so 0.2 can coordinate mutual exclusion with 0.1.x during a rolling upgrade. New deadlock metadata is written only under `uniquemutex-meta-v2:*`; 0.2 can read old metadata as a fallback.
+- Adding `namespace` intentionally creates a new lock domain under `uniquemutex-v2:*`. All participants in one logical lock domain must use the same namespace.
+- When cross-process deadlock coordination is available, nested waits use `coordinationFailureMode: 'strict'` by default. Choose `'best-effort'` explicitly if you prefer availability when metadata Redis is unavailable.
+- For applications with many managers, prefer one shared `redis.clients` connection (or one shared Redlock + coordination client) instead of creating a Redis connection per manager.
 
 ## API
+
+### Distributed constructor options
+
+- `redlock`: externally owned Redlock instance. Pair with `coordinationClient` when cross-process deadlock detection is required.
+- `redis.urls`: one or more Redis URLs for manager-owned clients.
+- `redis.clients`: externally owned `ioredis` Redis/Cluster clients that can be shared by many mutex managers.
+- `redis.settings`: Redlock settings used when the manager constructs Redlock. Acquisition still uses one bounded attempt at a time; `retryDelay`/`retryJitter` define the backoff envelope.
+- `namespace`: explicit distributed lock domain. Recommended when an application has multiple independent mutex registries.
+- `coordinationFailureMode`: `strict` by default, or `best-effort` to continue nested waits when deadlock metadata is unavailable.
+- `lockTTL`: positive safe-integer lease duration in milliseconds.
+- `lockExtendInterval`: renewal interval; `0` or a negative value disables automatic renewal, otherwise it must be shorter than `lockTTL`.
 
 ### `runOperation(id, operation, options?)`
 
@@ -158,7 +204,7 @@ surfaced.
 
 `options` accepts:
 
-- `waitIfLocked`: defaults to `true`. Set to `false` to throw immediately when the mutex is already owned.
+- `waitIfLocked`: defaults to `true`. Set to `false` for a single non-blocking attempt; the callback is skipped and the call resolves to `undefined` when the mutex is occupied.
 - `timeoutMs`: optional number of milliseconds to wait before throwing `MutexTimeoutError`. When omitted the operation waits
   indefinitely. Supplying `0` (or a negative value) performs a single attempt that fails with `MutexTimeoutError` if the mutex
   is not free.
@@ -201,7 +247,7 @@ Use `manager.isAsyncContextTrackingSupported()` to determine whether your runtim
 
 ### `MutexLockedError`
 
-Thrown when an operation is configured not to wait for the mutex and the mutex is already occupied. The error has an `id` property that contains the mutex identifier.
+Retained as an exported compatibility type for applications that referenced earlier 0.1.x behavior. Current `waitIfLocked: false` calls resolve to `undefined` on contention so local and distributed managers have the same non-blocking contract.
 
 ### `MutexTimeoutError`
 
@@ -238,4 +284,4 @@ Returns `true` when the runtime exposes `AsyncLocalStorage` (Node.js 14+). When 
 
 ## License
 
-ISC
+WTFPL
