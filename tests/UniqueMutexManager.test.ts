@@ -204,32 +204,38 @@ describe('UniqueMutexManager (single process)', () => {
     expect(completionOrder).toEqual([0, 1, 2, 3, 4]);
   });
 
-  it('preserves execution order when waiting metadata updates are delayed', async () => {
+  it('preserves execution order when nested wait metadata publication is delayed', async () => {
     const manager = new UniqueMutexManager();
     const managerWithHooks = manager as unknown as {
-      updateWaitingState: (context: unknown, waitingFor?: string) => Promise<void> | void;
+      publishWaitingState: (context: unknown) => Promise<void> | void;
     };
-    const originalUpdate = managerWithHooks.updateWaitingState.bind(manager);
-    managerWithHooks.updateWaitingState = async function (context: unknown, waitingFor?: string) {
+    const originalPublish = managerWithHooks.publishWaitingState.bind(manager);
+    managerWithHooks.publishWaitingState = async function (context: unknown) {
       await sleep(10);
-      return originalUpdate(context, waitingFor);
+      return originalPublish(context);
     };
 
     const startOrder: number[] = [];
+    let firstStarted!: () => void;
+    const firstReady = new Promise<void>((resolve) => { firstStarted = resolve; });
 
     try {
       const first = manager.runOperation('shared', async () => {
         startOrder.push(1);
-        await sleep(5);
+        firstStarted();
+        await sleep(15);
       });
+      await firstReady;
 
-      const second = manager.runOperation('shared', async () => {
-        startOrder.push(2);
-      });
+      const second = manager.runOperation('outer', async () =>
+        manager.runOperation('shared', async () => {
+          startOrder.push(2);
+        })
+      );
 
       await Promise.all([first, second]);
     } finally {
-      managerWithHooks.updateWaitingState = originalUpdate;
+      managerWithHooks.publishWaitingState = originalPublish;
     }
 
     expect(startOrder).toEqual([1, 2]);
@@ -1049,6 +1055,62 @@ describe('UniqueMutexManager (single process)', () => {
       expect(events).toContain(`start:${label}`);
       expect(events).toContain(`end:${label}`);
     }
+  });
+
+  it('does not attach an old wait to a later ownership generation of the same mutex id', async () => {
+    const manager = new UniqueMutexManager();
+    const contextX = manager.createContext();
+    const contextY = manager.createContext();
+    const internal = manager as unknown as {
+      getContextFromToken: (context: MutexRunContext) => { waits: Map<string, unknown> };
+    };
+
+    let beginYWait!: () => void;
+    const yMayWait = new Promise<void>((resolve) => { beginYWait = resolve; });
+    let bHeld!: () => void;
+    const bReady = new Promise<void>((resolve) => { bHeld = resolve; });
+
+    const yFlow = manager.runOperation('generation-b', async () => {
+      bHeld();
+      await yMayWait;
+      return manager.runOperation(
+        'generation-a',
+        async () => 'y-acquired-a',
+        { context: contextY }
+      );
+    }, { context: contextY });
+    await bReady;
+
+    let staleWait!: Promise<string>;
+    await manager.runOperation('generation-a', async () => {
+      staleWait = manager.runOperation(
+        'generation-b',
+        async () => 'x-acquired-b',
+        { context: contextX }
+      );
+      while (internal.getContextFromToken(contextX).waits.size === 0) {
+        await sleep(1);
+      }
+      return 'first-generation-released';
+    }, { context: contextX });
+
+    let releaseSecondA!: () => void;
+    let secondAHeld!: () => void;
+    const secondAReady = new Promise<void>((resolve) => { secondAHeld = resolve; });
+    const secondA = manager.runOperation('generation-a', async () => {
+      secondAHeld();
+      await new Promise<void>((resolve) => { releaseSecondA = resolve; });
+      return 'second-generation-released';
+    }, { context: contextX });
+    await secondAReady;
+
+    beginYWait();
+    await sleep(20);
+    releaseSecondA();
+
+    await expect(secondA).resolves.toBe('second-generation-released');
+    await expect(yFlow).resolves.toBe('y-acquired-a');
+    await expect(staleWait).resolves.toBe('x-acquired-b');
   });
 
   it('handles bursty contention across many mutex ids', async () => {
@@ -1950,62 +2012,150 @@ describe('UniqueMutexManager (single process)', () => {
     expect(result).toBe('success');
   });
 
-  it('survives coordination client failures without hanging', async () => {
-    // Create a mock coordination client that throws on operations
-    const failingClient = {
-      multi: () => ({
-        hset: () => failingClient.multi(),
-        hdel: () => failingClient.multi(),
-        del: () => failingClient.multi(),
-        pexpire: () => failingClient.multi(),
-        exec: async () => {
-          throw new Error('Coordination failure');
-        },
-      }),
-      set: async () => {
-        throw new Error('Coordination failure');
-      },
-      get: async () => {
-        throw new Error('Coordination failure');
-      },
-      hget: async () => {
-        throw new Error('Coordination failure');
-      },
-      del: async () => {
-        throw new Error('Coordination failure');
-      },
+  it('fails nested distributed waits closed when coordination metadata is unavailable', async () => {
+    let coordinationAttempts = 0;
+    const fail = async () => {
+      coordinationAttempts += 1;
+      throw new Error('Coordination failure');
     };
-
+    const failingClient = {
+      hset: fail, pexpire: fail, set: fail, del: fail, eval: fail,
+      get: fail, hmget: fail,
+    };
+    const fakeRedlock = {
+      settings: { retryDelay: 1, retryJitter: 0 },
+      acquire: async () => ({
+        expiration: Date.now() + 10_000,
+        release: async () => undefined,
+      }),
+    };
     const manager = new UniqueMutexManager({
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      redlock: fakeRedlock as any,
       coordinationClient: failingClient as any,
+      lockExtendInterval: 0,
     });
 
-    const events: string[] = [];
-    let concurrent = 0;
+    let releaseInner!: () => void;
+    let innerStarted!: () => void;
+    const innerReady = new Promise<void>((resolve) => { innerStarted = resolve; });
+    const blocker = manager.runOperation('coord-inner', async () => {
+      innerStarted();
+      await new Promise<void>((resolve) => { releaseInner = resolve; });
+    });
+    await innerReady;
 
-    // Local serialization should still work even when coordination fails
-    const tasks = Array.from({ length: 5 }, (_, idx) =>
-      manager.runOperation('coord-failure', async () => {
-        concurrent += 1;
-        expect(concurrent).toBe(1);
-        events.push(`start-${idx}`);
-        await sleep(10);
-        events.push(`end-${idx}`);
-        concurrent -= 1;
-        return idx;
-      })
+    const nested = manager.runOperation('coord-outer', async () =>
+      manager.runOperation('coord-inner', async () => 'nested-complete')
     );
+    await expect(nested).rejects.toBeInstanceOf(DistributedLockError);
+    expect(coordinationAttempts).toBeGreaterThan(0);
+    releaseInner();
+    await blocker;
+  });
 
-    const results = await Promise.all(tasks);
-    expect(results).toEqual([0, 1, 2, 3, 4]);
-    expect(events).toHaveLength(10);
-    // Verify serialization: each start should be followed by its end
-    for (let i = 0; i < 5; i++) {
-      const startIdx = events.indexOf(`start-${i}`);
-      const endIdx = events.indexOf(`end-${i}`);
-      expect(startIdx).toBeLessThan(endIdx);
-    }
+  it('honors timeout while distributed deadlock metadata I/O is hung', async () => {
+    const never = async () => new Promise<never>(() => {});
+    const manager = new UniqueMutexManager({
+      redlock: {
+        settings: { retryDelay: 1, retryJitter: 0 },
+        acquire: async () => ({ expiration: Date.now() + 10_000, release: async () => undefined }),
+      } as any,
+      coordinationClient: {
+        hset: never, pexpire: never, set: never, del: never, eval: never,
+        get: never, hmget: never,
+      } as any,
+      lockExtendInterval: 0,
+    });
+
+    let releaseInner!: () => void;
+    let innerStarted!: () => void;
+    const innerReady = new Promise<void>((resolve) => { innerStarted = resolve; });
+    const blocker = manager.runOperation('hung-meta-inner', async () => {
+      innerStarted();
+      await new Promise<void>((resolve) => { releaseInner = resolve; });
+    });
+    await innerReady;
+
+    const startedAt = Date.now();
+    const nested = manager.runOperation('hung-meta-outer', async () =>
+      manager.runOperation('hung-meta-inner', async () => 'never', { timeoutMs: 60 })
+    );
+    await expect(nested).rejects.toBeInstanceOf(MutexTimeoutError);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+
+    releaseInner();
+    await blocker;
+  });
+
+  it('honors AbortSignal while distributed deadlock metadata I/O is hung', async () => {
+    const never = async () => new Promise<never>(() => {});
+    const manager = new UniqueMutexManager({
+      redlock: {
+        settings: { retryDelay: 1, retryJitter: 0 },
+        acquire: async () => ({ expiration: Date.now() + 10_000, release: async () => undefined }),
+      } as any,
+      coordinationClient: {
+        hset: never, pexpire: never, set: never, del: never, eval: never,
+        get: never, hmget: never,
+      } as any,
+      lockExtendInterval: 0,
+    });
+
+    let releaseInner!: () => void;
+    let innerStarted!: () => void;
+    const innerReady = new Promise<void>((resolve) => { innerStarted = resolve; });
+    const blocker = manager.runOperation('hung-abort-inner', async () => {
+      innerStarted();
+      await new Promise<void>((resolve) => { releaseInner = resolve; });
+    });
+    await innerReady;
+
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const nested = manager.runOperation('hung-abort-outer', async () =>
+      manager.runOperation('hung-abort-inner', async () => 'never', { signal: controller.signal })
+    );
+    setTimeout(() => controller.abort('cancelled'), 30);
+    await expect(nested).rejects.toBeInstanceOf(MutexAbortedError);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+
+    releaseInner();
+    await blocker;
+  });
+
+  it('can opt into best-effort coordination failure handling', async () => {
+    let coordinationAttempts = 0;
+    const fail = async () => {
+      coordinationAttempts += 1;
+      throw new Error('Coordination failure');
+    };
+    const manager = new UniqueMutexManager({
+      redlock: {
+        settings: { retryDelay: 1, retryJitter: 0 },
+        acquire: async () => ({ expiration: Date.now() + 10_000, release: async () => undefined }),
+      } as any,
+      coordinationClient: { hset: fail, pexpire: fail, set: fail, del: fail, eval: fail, get: fail, hmget: fail } as any,
+      coordinationFailureMode: 'best-effort',
+      lockExtendInterval: 0,
+    });
+
+    let releaseInner!: () => void;
+    let innerStarted!: () => void;
+    const innerReady = new Promise<void>((resolve) => { innerStarted = resolve; });
+    const blocker = manager.runOperation('coord-best-inner', async () => {
+      innerStarted();
+      await new Promise<void>((resolve) => { releaseInner = resolve; });
+    });
+    await innerReady;
+
+    const nested = manager.runOperation('coord-best-outer', async () =>
+      manager.runOperation('coord-best-inner', async () => 'nested-complete')
+    );
+    await sleep(20);
+    expect(coordinationAttempts).toBeGreaterThan(0);
+    releaseInner();
+    await blocker;
+    await expect(nested).resolves.toBe('nested-complete');
   });
 });
 
@@ -2020,6 +2170,57 @@ describe('package loading', () => {
     if (buildResult.status !== 0) {
       const stderr = buildResult.stderr?.toString() ?? 'unknown error';
       throw new Error(`Failed to build package before load checks: ${stderr}`);
+    }
+  });
+
+  it('typechecks a local-only consumer without optional peer packages installed', () => {
+    const tempRoot = fs.mkdtempSync(path.join('/tmp', 'uniquemutex-types-'));
+    try {
+      const packageDir = path.join(tempRoot, 'node_modules', 'uniquemutexmanager');
+      fs.mkdirSync(packageDir, { recursive: true });
+      fs.cpSync(path.join(projectRoot, 'dist'), path.join(packageDir, 'dist'), { recursive: true });
+      fs.copyFileSync(path.join(projectRoot, 'package.json'), path.join(packageDir, 'package.json'));
+      fs.writeFileSync(
+        path.join(tempRoot, 'index.ts'),
+        `import { UniqueMutexManager } from 'uniquemutexmanager';
+` +
+          `const manager = new UniqueMutexManager();
+` +
+          `void manager.runOperation('local-only', async () => 42);
+`
+      );
+      fs.writeFileSync(
+        path.join(tempRoot, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            strict: true,
+            noEmit: true,
+            target: 'ES2022',
+            module: 'NodeNext',
+            moduleResolution: 'NodeNext',
+            lib: ['ES2022', 'DOM'],
+            skipLibCheck: false,
+          },
+          files: ['index.ts'],
+        })
+      );
+
+      const tscPath = path.join(projectRoot, 'node_modules', 'typescript', 'bin', 'tsc');
+      const result = spawnSync(process.execPath, [tscPath, '-p', tempRoot], {
+        cwd: tempRoot,
+        stdio: 'pipe',
+      });
+      const stderr = result.stderr?.toString() ?? '';
+      const stdout = result.stdout?.toString() ?? '';
+      if (result.status !== 0) {
+        throw new Error(`Isolated TypeScript consumer failed.
+STDOUT: ${stdout}
+STDERR: ${stderr}`);
+      }
+      expect(stdout).not.toContain('ioredis');
+      expect(stdout).not.toContain('redlock');
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 
@@ -2157,6 +2358,228 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await managerB.dispose();
   });
 
+  it('does not publish deadlock metadata for an uncontended distributed acquisition', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const redlock = new Redlock([client], { retryCount: 0 });
+    const tracked = client as any;
+    let coordinationCalls = 0;
+
+    for (const method of ['hset', 'pexpire', 'set', 'del', 'get', 'hmget'] as const) {
+      const original = tracked[method].bind(client);
+      tracked[method] = (...args: unknown[]) => {
+        coordinationCalls += 1;
+        return original(...args);
+      };
+    }
+
+    const manager = new UniqueMutexManager({
+      redlock,
+      coordinationClient: client,
+    });
+
+    await expect(
+      manager.runOperation('fast-path-metadata', async () => 'done')
+    ).resolves.toBe('done');
+    expect(coordinationCalls).toBe(0);
+
+    await client.quit();
+  });
+
+  it('isolates equal mutex ids across explicit namespaces', async () => {
+    const managerA = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'payments',
+    });
+    const managerB = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'inventory',
+    });
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const run = (manager: UniqueMutexManager, value: string) =>
+      manager.runOperation('shared-id', async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await sleep(50);
+        concurrent -= 1;
+        return value;
+      });
+
+    await expect(Promise.all([run(managerA, 'A'), run(managerB, 'B')])).resolves.toEqual(['A', 'B']);
+    expect(maxConcurrent).toBe(2);
+
+    const managerC = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'payments',
+    });
+    concurrent = 0;
+    maxConcurrent = 0;
+    await expect(Promise.all([run(managerA, 'A2'), run(managerC, 'C')])).resolves.toEqual(['A2', 'C']);
+    expect(maxConcurrent).toBe(1);
+
+    await managerA.dispose();
+    await managerB.dispose();
+    await managerC.dispose();
+  });
+
+  it('encodes namespace and mutex id components without delimiter collisions', async () => {
+    const managerA = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'a',
+    });
+    const managerB = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'a:lock:b',
+    });
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    await Promise.all([
+      managerA.runOperation('b:lock:c', async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await sleep(40);
+        concurrent -= 1;
+      }),
+      managerB.runOperation('c', async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await sleep(40);
+        concurrent -= 1;
+      }),
+    ]);
+
+    expect(maxConcurrent).toBe(2);
+    await managerA.dispose();
+    await managerB.dispose();
+  });
+
+  it('uses fast initial retries before backing off to the configured distributed retry delay', async () => {
+    const redis = {
+      urls: [redisUrl],
+      settings: { retryDelay: 500, retryJitter: 0 },
+    };
+    const managerA = new UniqueMutexManager({ redis, namespace: 'fast-handoff' });
+    const managerB = new UniqueMutexManager({ redis, namespace: 'fast-handoff' });
+
+    let blockerStarted!: () => void;
+    const blockerReady = new Promise<void>((resolve) => { blockerStarted = resolve; });
+    const blocker = managerA.runOperation('handoff', async () => {
+      blockerStarted();
+      await sleep(25);
+    });
+    await blockerReady;
+
+    const startedAt = Date.now();
+    await expect(managerB.runOperation('handoff', async () => 'acquired')).resolves.toBe('acquired');
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(300);
+    await blocker;
+
+    await managerA.dispose();
+    await managerB.dispose();
+  });
+
+  it('keeps legacy and namespaced Redis lock domains disjoint for arbitrary ids', async () => {
+    const legacy = new UniqueMutexManager({ redis: { urls: [redisUrl] } });
+    const namespaced = new UniqueMutexManager({
+      redis: { urls: [redisUrl] },
+      namespace: 'payments',
+    });
+
+    // This legacy id intentionally resembles the v2 namespaced key suffix.
+    const legacyId = 'v2:payments:lock:invoice:123';
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const run = (manager: UniqueMutexManager, id: string) =>
+      manager.runOperation(id, async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await sleep(40);
+        concurrent -= 1;
+      });
+
+    await Promise.all([
+      run(legacy, legacyId),
+      run(namespaced, 'invoice:123'),
+    ]);
+    expect(maxConcurrent).toBe(2);
+
+    await legacy.dispose();
+    await namespaced.dispose();
+  });
+
+  it('reads legacy 0.1.x deadlock metadata during a rolling upgrade', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const redlock = new Redlock([client], { retryCount: 0 });
+    const heldRemote = await redlock.acquire(['uniquemutex:legacy-y'], 5000);
+
+    await client.set('uniquemutex:owner:legacy-y', 'legacy-context', 'PX', 5000);
+    await client.hset('uniquemutex:context:legacy-context', 'waitingFor', 'legacy-x');
+    await client.pexpire('uniquemutex:context:legacy-context', 5000);
+
+    const manager = new UniqueMutexManager({
+      redlock,
+      coordinationClient: client,
+      lockExtendInterval: 0,
+    });
+
+    await expect(
+      manager.runOperation('legacy-x', async () =>
+        manager.runOperation('legacy-y', async () => 'never', { timeoutMs: 500 })
+      )
+    ).rejects.toBeInstanceOf(MutexDeadlockError);
+
+    await heldRemote.release();
+    await client.del(
+      'uniquemutex:owner:legacy-y',
+      'uniquemutex:context:legacy-context'
+    );
+    await client.quit();
+  });
+
+  it('does not write v2 metadata into legacy mutex resource keys', async () => {
+    const client = new IORedis(redisUrl);
+    const managerA = new UniqueMutexManager({ redis: { clients: [client] } });
+    const managerB = new UniqueMutexManager({ redis: { clients: [client] } });
+
+    let releaseBar!: () => void;
+    let barStarted!: () => void;
+    const barReady = new Promise<void>((resolve) => { barStarted = resolve; });
+    const barBlocker = managerB.runOperation('bar', async () => {
+      barStarted();
+      await new Promise<void>((resolve) => { releaseBar = resolve; });
+    });
+    await barReady;
+
+    let nestedStarted!: () => void;
+    const nestedReady = new Promise<void>((resolve) => { nestedStarted = resolve; });
+    const flow = managerA.runOperation('foo', async () => {
+      const nested = managerA.runOperation('bar', async () => 'bar-acquired');
+      while ((await client.exists('uniquemutex-meta-v2:legacy:owner:foo')) === 0) {
+        await sleep(1);
+      }
+      nestedStarted();
+      return nested;
+    });
+    await nestedReady;
+
+    expect(await client.exists('uniquemutex:owner:foo')).toBe(0);
+    await expect(
+      managerB.runOperation('owner:foo', async () => 'independent')
+    ).resolves.toBe('independent');
+
+    releaseBar();
+    await expect(flow).resolves.toBe('bar-acquired');
+    await barBlocker;
+    await managerA.dispose();
+    await managerB.dispose();
+    await client.quit();
+  });
+
   it('waits independently of the Redlock retryCount when no timeout is provided', async () => {
     const redis = {
       urls: [redisUrl],
@@ -2204,9 +2627,94 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     } as any;
     const manager = new UniqueMutexManager({ redlock });
 
+    const error = await manager
+      .runOperation('infra-failure', async () => 'never', { waitIfLocked: false })
+      .catch((caught) => caught);
+    expect(error).toBeInstanceOf(DistributedLockError);
+    expect((error as DistributedLockError).cause).toBe(infrastructureError);
+  });
+
+  it('honors timeout when a Redlock acquire call never settles', async () => {
+    const manager = new UniqueMutexManager({
+      redlock: {
+        acquire: async () => new Promise<never>(() => {}),
+        extend: async () => { throw new Error('not reached'); },
+      },
+      lockExtendInterval: 0,
+    });
+    let ran = false;
+    const startedAt = Date.now();
+
     await expect(
-      manager.runOperation('infra-failure', async () => 'never', { waitIfLocked: false })
-    ).rejects.toBeInstanceOf(DistributedLockError);
+      manager.runOperation('hung-acquire-timeout', async () => {
+        ran = true;
+        return 'never';
+      }, { timeoutMs: 60 })
+    ).rejects.toBeInstanceOf(MutexTimeoutError);
+
+    expect(ran).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  it('honors AbortSignal when a Redlock acquire call never settles', async () => {
+    const manager = new UniqueMutexManager({
+      redlock: {
+        acquire: async () => new Promise<never>(() => {}),
+        extend: async () => { throw new Error('not reached'); },
+      },
+      lockExtendInterval: 0,
+    });
+    const controller = new AbortController();
+    let ran = false;
+    const startedAt = Date.now();
+    const operation = manager.runOperation('hung-acquire-abort', async () => {
+      ran = true;
+      return 'never';
+    }, { signal: controller.signal });
+
+    setTimeout(() => controller.abort('cancelled'), 30);
+    await expect(operation).rejects.toBeInstanceOf(MutexAbortedError);
+    expect(ran).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  it('releases an acquire that succeeds only after its caller timed out', async () => {
+    let resolveAcquire!: (lock: {
+      resources: string[];
+      expiration: number;
+      release: () => Promise<void>;
+    }) => void;
+    const acquisition = new Promise<{
+      resources: string[];
+      expiration: number;
+      release: () => Promise<void>;
+    }>((resolve) => { resolveAcquire = resolve; });
+    let lateReleaseCalls = 0;
+    let ran = false;
+    const manager = new UniqueMutexManager({
+      redlock: {
+        acquire: async () => acquisition,
+        extend: async () => { throw new Error('not reached'); },
+      },
+      lockExtendInterval: 0,
+    });
+
+    await expect(
+      manager.runOperation('late-acquire', async () => {
+        ran = true;
+        return 'never';
+      }, { timeoutMs: 40 })
+    ).rejects.toBeInstanceOf(MutexTimeoutError);
+
+    resolveAcquire({
+      resources: ['late-acquire'],
+      expiration: Date.now() + 5000,
+      release: async () => { lateReleaseCalls += 1; },
+    });
+    await sleep(20);
+
+    expect(ran).toBe(false);
+    expect(lateReleaseCalls).toBe(1);
   });
 
   it('applies timeouts while waiting on distributed locks', async () => {
@@ -2605,6 +3113,54 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await manager.dispose();
   });
 
+  it('shares externally supplied Redis clients without taking ownership', async () => {
+    const client = new IORedis(redisUrl);
+    const managerA = new UniqueMutexManager({
+      redis: { clients: [client], settings: { retryDelay: 10, retryJitter: 0 } },
+      namespace: 'shared-client',
+    });
+    const managerB = new UniqueMutexManager({
+      redis: { clients: [client], settings: { retryDelay: 10, retryJitter: 0 } },
+      namespace: 'shared-client',
+    });
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    await Promise.all([managerA, managerB].map((manager) =>
+      manager.runOperation('same-id', async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await sleep(30);
+        concurrent -= 1;
+      })
+    ));
+    expect(maxConcurrent).toBe(1);
+
+    await managerA.dispose();
+    await managerB.dispose();
+    await expect(client.ping()).resolves.toBe('PONG');
+    await client.quit();
+  });
+
+  it('owns Redis clients created through the URL client factory', async () => {
+    let createdClient: IORedis | undefined;
+    const manager = new UniqueMutexManager({
+      redis: {
+        urls: [redisUrl],
+        createClient: (url) => {
+          createdClient = new IORedis(url);
+          return createdClient;
+        },
+      },
+    });
+
+    await expect(manager.runOperation('factory-client', async () => 'ok')).resolves.toBe('ok');
+    expect(createdClient).toBeDefined();
+    await manager.dispose();
+    await expect(createdClient!.ping()).rejects.toThrow('Connection is closed');
+    expect(createdClient?.status).toBe('end');
+  });
+
   it('uses custom redlock instance when provided', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
@@ -2636,28 +3192,17 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await client.quit();
   });
 
-  it('uses custom coordinationClient for metadata operations', async () => {
+  it('uses custom coordinationClient for nested wait metadata operations', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
     const customRedlock = new Redlock([client]);
-
-    let setCalls = 0;
-    let getCalls = 0;
-
-    // Create a wrapped client that tracks calls
     const coordinationClient = new IORedis(redisUrl);
-    const originalSet = coordinationClient.set.bind(coordinationClient);
-    const originalGet = coordinationClient.get.bind(coordinationClient);
-
-    coordinationClient.set = (async (...args: Parameters<typeof coordinationClient.set>) => {
-      setCalls += 1;
-      return originalSet(...args);
-    }) as typeof coordinationClient.set;
-
-    coordinationClient.get = (async (...args: Parameters<typeof coordinationClient.get>) => {
-      getCalls += 1;
-      return originalGet(...args);
-    }) as typeof coordinationClient.get;
+    const originalHset = coordinationClient.hset.bind(coordinationClient);
+    let metadataWrites = 0;
+    coordinationClient.hset = (async (...args: Parameters<typeof coordinationClient.hset>) => {
+      metadataWrites += 1;
+      return originalHset(...args);
+    }) as typeof coordinationClient.hset;
 
     const manager = new UniqueMutexManager({
       redlock: customRedlock,
@@ -2665,15 +3210,24 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
       coordinationClient,
     });
 
-    await manager.runOperation('custom-coordination', async () => {
-      await sleep(10);
-      return 'done';
+    let releaseInner!: () => void;
+    let innerStarted!: () => void;
+    const innerReady = new Promise<void>((resolve) => { innerStarted = resolve; });
+    const blocker = manager.runOperation('custom-coordination-inner', async () => {
+      innerStarted();
+      await new Promise<void>((resolve) => { releaseInner = resolve; });
     });
+    await innerReady;
 
-    // Coordination client should have been used for metadata
-    expect(setCalls).toBeGreaterThan(0);
+    const nested = manager.runOperation('custom-coordination-outer', async () =>
+      manager.runOperation('custom-coordination-inner', async () => 'done')
+    );
+    await sleep(20);
+    expect(metadataWrites).toBeGreaterThan(0);
+    releaseInner();
 
-    // Cleanup
+    await blocker;
+    await expect(nested).resolves.toBe('done');
     await client.quit();
     await coordinationClient.quit();
   });
@@ -2734,26 +3288,21 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
 
-    // Create a client with artificial latency
+    // Create a client with artificial latency on the commands Redlock actually uses.
     const latencyClient = new IORedis(redisUrl);
-    const originalExec = latencyClient.multi.bind(latencyClient);
+    const rawLatencyClient = latencyClient as any;
+    for (const method of ['evalsha', 'eval'] as const) {
+      const original = rawLatencyClient[method].bind(latencyClient);
+      rawLatencyClient[method] = async (...args: unknown[]) => {
+        await sleep(randomInt(50, 150));
+        return original(...args);
+      };
+    }
 
     // Track operation timing to verify no overlap
     let concurrent = 0;
     let maxConcurrent = 0;
     const events: { event: string; time: number }[] = [];
-
-    // Wrap multi to add latency
-    latencyClient.multi = function (...args: Parameters<typeof latencyClient.multi>) {
-      const pipeline = originalExec(...args);
-      const originalPipelineExec = pipeline.exec.bind(pipeline);
-      pipeline.exec = async function () {
-        // Add 50-150ms random latency
-        await sleep(randomInt(50, 150));
-        return originalPipelineExec();
-      };
-      return pipeline;
-    } as typeof latencyClient.multi;
 
     const customRedlock = new Redlock([latencyClient]);
 
@@ -2799,14 +3348,103 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     await latencyClient.quit();
   }, 30_000);
 
-  it('throws LockExtensionError when extension fails during operation', async () => {
-    const { LockExtensionError } = await import('../src/errors');
+  it('fails before the lease deadline when a Redlock extension never settles', async () => {
+    let resolveExtension!: (lock: {
+      resources: string[];
+      expiration: number;
+      release: () => Promise<void>;
+    }) => void;
+    const extension = new Promise<{
+      resources: string[];
+      expiration: number;
+      release: () => Promise<void>;
+    }>((resolve) => { resolveExtension = resolve; });
+    let lateExtensionReleaseCalls = 0;
+    const manager = new UniqueMutexManager({
+      redlock: {
+        acquire: async () => ({
+          resources: ['hung-extension'],
+          expiration: Date.now() + 200,
+          release: async () => undefined,
+        }),
+        extend: async () => extension,
+      },
+      lockTTL: 200,
+      lockExtendInterval: 50,
+    });
+    const startedAt = Date.now();
+
+    const operation = manager.runOperation('hung-extension', async ({ abortSignal }) => {
+      while (!abortSignal.aborted) {
+        await sleep(5);
+      }
+      return 'observed-abort';
+    });
+
+    await expect(operation).rejects.toBeInstanceOf(
+      (await import('../src/errors')).LockExtensionError
+    );
+    expect(Date.now() - startedAt).toBeLessThan(350);
+
+    resolveExtension({
+      resources: ['hung-extension'],
+      expiration: Date.now() + 5000,
+      release: async () => { lateExtensionReleaseCalls += 1; },
+    });
+    await sleep(20);
+    expect(lateExtensionReleaseCalls).toBe(1);
+  });
+
+  it('fails a lease immediately when Redis reports that ownership is lost', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client], { retryCount: 0 });
+    const originalExtend = customRedlock.extend.bind(customRedlock);
+    let extensionAttempts = 0;
+
+    customRedlock.extend = async function (...args: Parameters<typeof customRedlock.extend>) {
+      extensionAttempts += 1;
+      if (extensionAttempts === 1) {
+        const lock = args[0];
+        await client.del(lock.resources[0]);
+      }
+      return originalExtend(...args);
+    };
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 1000,
+      lockExtendInterval: 100,
+    });
+
+    const error = await manager
+      .runOperation('definite-lease-loss', async ({ abortSignal }) => {
+        while (!abortSignal.aborted) {
+          await sleep(10);
+        }
+        return 'observed-abort';
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf((await import('../src/errors')).LockExtensionError);
+    expect(extensionAttempts).toBe(1);
+    await client.quit();
+  }, 10_000);
+
+  it('recovers from transient extension failures while the lease remains safe', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
     const customRedlock = new Redlock([client]);
-
-    // Track extension attempts
     let extensionAttempts = 0;
+
+    const originalExtend = customRedlock.extend.bind(customRedlock);
+    customRedlock.extend = async function (...args: Parameters<typeof customRedlock.extend>) {
+      extensionAttempts += 1;
+      if (extensionAttempts >= 3 && extensionAttempts <= 5) {
+        throw new Error('Simulated transient extension failure');
+      }
+      return originalExtend(...args);
+    };
 
     const manager = new UniqueMutexManager({
       redlock: customRedlock,
@@ -2815,48 +3453,20 @@ describeDistributed('Bulletproof Mutex Tests', () => {
       coordinationClient: client,
     });
 
-    // Intercept the lock to make extension fail after a few attempts
-    const originalAcquire = customRedlock.acquire.bind(customRedlock);
-    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
-      const lock = await originalAcquire(...args);
-      lock.extend = async function (duration: number) {
-        extensionAttempts += 1;
-        if (extensionAttempts > 2) {
-          throw new Error('Simulated extension failure');
-        }
-
-        // Mock successful extension by updating expiration locally and returning lock
-        // @ts-ignore
-        lock.expiration = Date.now() + duration;
-        return lock;
-      };
-      return lock;
-    };
-
-    // Operation should throw LockExtensionError when extension fails
     await expect(
-      manager.runOperation('extension-failure-test', async ({ assertLock }) => {
-        // Wait for enough extension attempts to fail (need 3 consecutive failures)
-        // Since attempts > 2 fail, we need attempts 3, 4, 5 to fail.
-        // Wait until we have enough attempts
-        // The loop stops after 3 consecutive failures.
+      manager.runOperation('extension-recovery-test', async ({ assertLock }) => {
         const start = Date.now();
-        while (extensionAttempts < 5) {
-          if (Date.now() - start > 10000) throw new Error(`Timed out waiting for extension attempts (current: ${extensionAttempts})`);
-          await sleep(100);
+        while (extensionAttempts < 6) {
+          if (Date.now() - start > 10000) {
+            throw new Error(`Timed out waiting for extension recovery (current: ${extensionAttempts})`);
+          }
+          await sleep(50);
         }
-
-        // Give the manager a moment to process the failure in its background loop
-        await sleep(500);
-
-        // This should throw if extension failed
         assertLock();
-        return 'done';
+        return 'recovered';
       })
-    ).rejects.toThrow(LockExtensionError);
-
-    // Verify extension was attempted (may be exactly 2 or 3 depending on timing)
-    expect(extensionAttempts).toBeGreaterThanOrEqual(2);
+    ).resolves.toBe('recovered');
+    expect(extensionAttempts).toBeGreaterThanOrEqual(6);
 
     await client.quit();
   });
@@ -2874,14 +3484,9 @@ describeDistributed('Bulletproof Mutex Tests', () => {
       coordinationClient: client,
     });
 
-    // Intercept the lock to make extension fail immediately
-    const originalAcquire = customRedlock.acquire.bind(customRedlock);
-    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
-      const lock = await originalAcquire(...args);
-      lock.extend = async function (_duration: number) {
-        throw new Error('Immediate extension failure');
-      };
-      return lock;
+    // Intercept renewal to make every extension attempt fail immediately.
+    customRedlock.extend = async function () {
+      throw new Error('Immediate extension failure');
     };
 
     await expect(
@@ -2900,11 +3505,20 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     await client.quit();
   });
 
-  it('aborts immediately if lock expires locally during extension loop', async () => {
-    const { LockExtensionError } = await import('../src/errors');
+  it('detects local lease expiry even when the event loop stalls past the renewal timer', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
-    const customRedlock = new Redlock([client]);
+    const customRedlock = new Redlock([client], { retryCount: 0 });
+
+    const originalAcquire = customRedlock.acquire.bind(customRedlock);
+    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
+      const lock = await originalAcquire(...args);
+      // The manager accepts this lease because it initially has more than the
+      // configured safety margin, then the synchronous stall prevents timers
+      // from renewing it before assertLock runs.
+      lock.expiration = Date.now() + 40;
+      return lock;
+    };
 
     const manager = new UniqueMutexManager({
       redlock: customRedlock,
@@ -2913,36 +3527,16 @@ describeDistributed('Bulletproof Mutex Tests', () => {
       coordinationClient: client,
     });
 
-    // Intercept acquire to hijack the lock's expiration
-    const originalAcquire = customRedlock.acquire.bind(customRedlock);
-    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
-      const lock = await originalAcquire(...args);
-      const originalExtend = lock.extend.bind(lock);
-
-      // Override extend to simulate a delay that causes expiration
-      lock.extend = async function (duration: number) {
-        // Artificially expire the lock locally by modifying the expiration timestamp
-        // @ts-ignore - expiration is readonly but we force it for test
-        lock.expiration = Date.now() - 1000;
-
-        // Return original extend (which might fail or succeed on redis, 
-        // but local check should catch it first)
-        return originalExtend(duration);
-      };
-      return lock;
-    };
-
     await expect(
-      manager.runOperation('strict-expiry-test', async ({ assertLock }) => {
-        // Wait for extension loop to trigger
-        await sleep(200);
-
-        // Should throw because we forced invalidation
+      manager.runOperation('event-loop-expiry-test', async ({ assertLock }) => {
+        const stallUntil = Date.now() + 80;
+        while (Date.now() < stallUntil) {
+          // Deliberately block timers to model a severe event-loop pause.
+        }
         assertLock();
-
         return 'success';
       })
-    ).rejects.toThrow(/expired/); // Check for "expired" in error message
+    ).rejects.toThrow(/expired/);
 
     await client.quit();
   });
@@ -3256,6 +3850,42 @@ describe('Stress Tests & Client Misuse Protection', () => {
     await client.quit();
   }, 10_000);
 
+  it('never overlaps asynchronous lock extension attempts', async () => {
+    const client = new IORedis(redisUrl);
+    const Redlock = (await import('redlock')).default;
+    const customRedlock = new Redlock([client], { retryCount: 0 });
+    const originalExtend = customRedlock.extend.bind(customRedlock);
+    let concurrentExtensions = 0;
+    let maxConcurrentExtensions = 0;
+    let extensionCount = 0;
+
+    customRedlock.extend = async function (...args: Parameters<typeof customRedlock.extend>) {
+      extensionCount += 1;
+      concurrentExtensions += 1;
+      maxConcurrentExtensions = Math.max(maxConcurrentExtensions, concurrentExtensions);
+      try {
+        await sleep(70);
+        return await originalExtend(...args);
+      } finally {
+        concurrentExtensions -= 1;
+      }
+    };
+
+    const manager = new UniqueMutexManager({
+      redlock: customRedlock,
+      lockTTL: 600,
+      lockExtendInterval: 20,
+    });
+
+    await manager.runOperation('non-overlapping-extension', async () => {
+      await sleep(240);
+    });
+
+    expect(extensionCount).toBeGreaterThanOrEqual(2);
+    expect(maxConcurrentExtensions).toBe(1);
+    await client.quit();
+  }, 10_000);
+
   it('handles rapid lock reacquisition stress (100 cycles)', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
@@ -3386,7 +4016,7 @@ describe('Stress Tests & Client Misuse Protection', () => {
     await client.quit();
   }, 10_000);
 
-  it('handles operation that never completes when extension fails', async () => {
+  it('lets another instance recover after lease loss even if the old callback never settles', async () => {
     const client = new IORedis(redisUrl);
     const Redlock = (await import('redlock')).default;
 
@@ -3396,21 +4026,15 @@ describe('Stress Tests & Client Misuse Protection', () => {
       retryDelay: 50,
     });
 
-    // Mock extension to fail after 2 successful extensions
+    // Mock renewal to fail after 2 successful immutable lease extensions.
     let extensionAttempts = 0;
-    const originalAcquire = customRedlock.acquire.bind(customRedlock);
-    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
-      const lock = await originalAcquire(...args);
-      lock.extend = async function (duration: number) {
-        extensionAttempts++;
-        if (extensionAttempts > 2) {
-          throw new Error('Simulated extension failure - connection lost');
-        }
-        // @ts-ignore - update expiration manually for the mock
-        lock.expiration = Date.now() + duration;
-        return lock;
-      };
-      return lock;
+    const originalExtend = customRedlock.extend.bind(customRedlock);
+    customRedlock.extend = async function (...args: Parameters<typeof customRedlock.extend>) {
+      extensionAttempts++;
+      if (extensionAttempts > 2) {
+        throw new Error('Simulated extension failure - connection lost');
+      }
+      return originalExtend(...args);
     };
 
     const manager = new UniqueMutexManager({
@@ -3420,20 +4044,15 @@ describe('Stress Tests & Client Misuse Protection', () => {
       coordinationClient: client,
     });
 
-    // Start an operation that hangs forever
-    let operationAborted = false;
-    const hangingPromise = manager.runOperation('extension-fails', async () => {
-      try {
-        await new Promise(() => { }); // Never resolves
-      } catch {
-        operationAborted = true;
-      }
-    }).catch(() => {
-      // Operation will fail due to extension failure
+    // JavaScript cannot forcibly terminate an arbitrary promise. This callback
+    // deliberately ignores abortSignal forever; the distributed guarantee is
+    // that the manager stops renewing its lease so another instance can recover.
+    void manager.runOperation('extension-fails', async () => {
+      await new Promise(() => { });
     });
 
-    // Wait for extension failures to trigger (3 consecutive failures after 2 successes)
-    // At 50ms interval: 50ms (success), 100ms (success), 150ms (fail), 200ms (fail), 250ms (fail)
+    // Two renewals succeed, later renewal attempts fail, and the 200ms lease is
+    // allowed to expire once it can no longer be renewed safely.
     await sleep(400);
 
     // Another manager should be able to acquire the lock now
@@ -3461,6 +4080,92 @@ describe('Stress Tests & Client Misuse Protection', () => {
     await client.quit();
     await client2.quit();
   }, 15_000);
+
+  it('rejects unsafe lease timing configuration', () => {
+    expect(() => new UniqueMutexManager({ lockTTL: 0 })).toThrow('lockTTL');
+    expect(() => new UniqueMutexManager({ lockTTL: 100, lockExtendInterval: 100 })).toThrow(
+      'lockExtendInterval must be shorter than lockTTL'
+    );
+    expect(() => new UniqueMutexManager({ lockTTL: 100, lockExtendInterval: 0 })).not.toThrow();
+  });
+
+  it('rejects ambiguous or invalid Redis configuration', () => {
+    expect(() => new UniqueMutexManager({ redis: { clients: [] } })).toThrow(
+      'At least one Redis client'
+    );
+    expect(() =>
+      new UniqueMutexManager({
+        redis: { clients: [{} as any], urls: 'redis://127.0.0.1:6379' },
+      })
+    ).toThrow('either redis.clients or redis.urls');
+    expect(() =>
+      new UniqueMutexManager({
+        redis: { clients: [{} as any], createClient: () => ({} as any) },
+      })
+    ).toThrow('redis.createClient cannot be combined with redis.clients');
+    expect(() => new UniqueMutexManager({ redis: { urls: '   ' } })).toThrow(
+      'Redis URLs must be non-empty strings'
+    );
+    expect(() =>
+      new UniqueMutexManager({ redis: { urls: 'redis://unused', settings: { driftFactor: NaN } } })
+    ).toThrow('driftFactor');
+    expect(() =>
+      new UniqueMutexManager({ redis: { urls: 'redis://unused', settings: { retryCount: -2 } } })
+    ).toThrow('retryCount');
+    expect(() =>
+      new UniqueMutexManager({ redis: { urls: 'redis://unused', settings: { retryDelay: Infinity } } })
+    ).toThrow('retryDelay');
+  });
+
+  it('rejects malformed lease deadlines from custom Redlock implementations', async () => {
+    const manager = new UniqueMutexManager({
+      redlock: {
+        acquire: async () => ({
+          resources: ['bad-lease'],
+          expiration: Number.NaN,
+          release: async () => undefined,
+        }),
+        extend: async () => {
+          throw new Error('not reached');
+        },
+      },
+      lockExtendInterval: 0,
+    });
+
+    await expect(
+      manager.runOperation('bad-lease', async () => 'never')
+    ).rejects.toBeInstanceOf(DistributedLockError);
+  });
+
+  it('rejects coordination metadata without distributed locking', () => {
+    expect(() =>
+      new UniqueMutexManager({ coordinationClient: {} as any })
+    ).toThrow('coordinationClient requires distributed locking');
+  });
+
+  it('rejects empty distributed namespaces', () => {
+    expect(() => new UniqueMutexManager({ namespace: '   ' })).toThrow(
+      'Mutex namespace must be a non-empty string'
+    );
+  });
+
+  it('rejects timer values that JavaScript would reinterpret unsafely', async () => {
+    expect(() => new UniqueMutexManager({ lockTTL: Number.MAX_SAFE_INTEGER + 1 })).toThrow('lockTTL');
+    expect(() => new UniqueMutexManager({ lockTTL: 2_147_483_648 })).toThrow(
+      'lockTTL must not exceed'
+    );
+    expect(() =>
+      new UniqueMutexManager({ lockTTL: 2_147_483_647, lockExtendInterval: 2_147_483_648 })
+    ).toThrow('lockExtendInterval must not exceed');
+
+    const manager = new UniqueMutexManager();
+    await expect(
+      manager.runOperation('bad-timeout-infinity', async () => 'never', { timeoutMs: Infinity })
+    ).rejects.toThrow('timeoutMs must be a finite number');
+    await expect(
+      manager.runOperation('bad-timeout-large', async () => 'never', { timeoutMs: 2_147_483_648 })
+    ).rejects.toThrow('timeoutMs must not exceed');
+  });
 
   it('throws error for invalid mutex IDs', async () => {
     const manager = new UniqueMutexManager();
@@ -3563,16 +4268,11 @@ describe('Stress Tests & Client Misuse Protection', () => {
     const Redlock = (await import('redlock')).default;
     const customRedlock = new Redlock([client]);
 
-    // Mock extension to fail immediately
+    // Mock extension to fail immediately.
     let extensionCount = 0;
-    const originalAcquire = customRedlock.acquire.bind(customRedlock);
-    customRedlock.acquire = async function (...args: Parameters<typeof customRedlock.acquire>) {
-      const lock = await originalAcquire(...args);
-      lock.extend = async function () {
-        extensionCount++;
-        throw new Error('Simulated extension failure');
-      };
-      return lock;
+    customRedlock.extend = async function () {
+      extensionCount++;
+      throw new Error('Simulated extension failure');
     };
 
     const manager = new UniqueMutexManager({
