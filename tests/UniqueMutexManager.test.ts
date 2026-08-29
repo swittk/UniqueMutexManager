@@ -2,6 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn, spawnSync, fork } from 'node:chi
 import * as fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
+import os from 'node:os';
 import { randomInt } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Worker } from 'node:worker_threads';
@@ -14,6 +15,7 @@ import { UniqueMutexManager } from '../src/UniqueMutexManager';
 import type { MutexRunContext } from '../src/UniqueMutexManager';
 import {
   DistributedLockError,
+  LockExtensionError,
   MutexAbortedError,
   MutexDeadlockError,
   MutexTimeoutError,
@@ -2020,7 +2022,7 @@ describe('UniqueMutexManager (single process)', () => {
     };
     const failingClient = {
       hset: fail, pexpire: fail, set: fail, del: fail, eval: fail,
-      get: fail, hmget: fail,
+      get: fail, hget: fail,
     };
     const fakeRedlock = {
       settings: { retryDelay: 1, retryJitter: 0 },
@@ -2062,7 +2064,7 @@ describe('UniqueMutexManager (single process)', () => {
       } as any,
       coordinationClient: {
         hset: never, pexpire: never, set: never, del: never, eval: never,
-        get: never, hmget: never,
+        get: never, hget: never,
       } as any,
       lockExtendInterval: 0,
     });
@@ -2096,7 +2098,7 @@ describe('UniqueMutexManager (single process)', () => {
       } as any,
       coordinationClient: {
         hset: never, pexpire: never, set: never, del: never, eval: never,
-        get: never, hmget: never,
+        get: never, hget: never,
       } as any,
       lockExtendInterval: 0,
     });
@@ -2134,7 +2136,7 @@ describe('UniqueMutexManager (single process)', () => {
         settings: { retryDelay: 1, retryJitter: 0 },
         acquire: async () => ({ expiration: Date.now() + 10_000, release: async () => undefined }),
       } as any,
-      coordinationClient: { hset: fail, pexpire: fail, set: fail, del: fail, eval: fail, get: fail, hmget: fail } as any,
+      coordinationClient: { hset: fail, pexpire: fail, set: fail, del: fail, eval: fail, get: fail, hget: fail } as any,
       coordinationFailureMode: 'best-effort',
       lockExtendInterval: 0,
     });
@@ -2174,11 +2176,18 @@ describe('package loading', () => {
   });
 
   it('typechecks a local-only consumer without optional peer packages installed', () => {
-    const tempRoot = fs.mkdtempSync(path.join('/tmp', 'uniquemutex-types-'));
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'uniquemutex-types-'));
     try {
+      const distDir = path.join(projectRoot, 'dist');
+      if (!fs.existsSync(distDir) || !fs.statSync(distDir).isDirectory()) {
+        throw new Error(
+          `Expected built package output at ${distDir}; package-loading setup must build dist before this test.`
+        );
+      }
+
       const packageDir = path.join(tempRoot, 'node_modules', 'uniquemutexmanager');
       fs.mkdirSync(packageDir, { recursive: true });
-      fs.cpSync(path.join(projectRoot, 'dist'), path.join(packageDir, 'dist'), { recursive: true });
+      fs.cpSync(distDir, path.join(packageDir, 'dist'), { recursive: true });
       fs.copyFileSync(path.join(projectRoot, 'package.json'), path.join(packageDir, 'package.json'));
       fs.writeFileSync(
         path.join(tempRoot, 'index.ts'),
@@ -2365,7 +2374,7 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     const tracked = client as any;
     let coordinationCalls = 0;
 
-    for (const method of ['hset', 'pexpire', 'set', 'del', 'get', 'hmget'] as const) {
+    for (const method of ['hset', 'pexpire', 'set', 'del', 'get', 'hget'] as const) {
       const original = tracked[method].bind(client);
       tracked[method] = (...args: unknown[]) => {
         coordinationCalls += 1;
@@ -3457,7 +3466,7 @@ describeDistributed('Bulletproof Mutex Tests', () => {
       manager.runOperation('extension-recovery-test', async ({ assertLock }) => {
         const start = Date.now();
         while (extensionAttempts < 6) {
-          if (Date.now() - start > 10000) {
+          if (Date.now() - start > 8_000) {
             throw new Error(`Timed out waiting for extension recovery (current: ${extensionAttempts})`);
           }
           await sleep(50);
@@ -3469,7 +3478,7 @@ describeDistributed('Bulletproof Mutex Tests', () => {
     expect(extensionAttempts).toBeGreaterThanOrEqual(6);
 
     await client.quit();
-  });
+  }, 10_000);
 
   it('allows cooperative cancellation via assertLock() when extension fails', async () => {
     const { LockExtensionError } = await import('../src/errors');
@@ -4047,8 +4056,14 @@ describe('Stress Tests & Client Misuse Protection', () => {
     // JavaScript cannot forcibly terminate an arbitrary promise. This callback
     // deliberately ignores abortSignal forever; the distributed guarantee is
     // that the manager stops renewing its lease so another instance can recover.
+    let unexpectedPendingOperationError: unknown;
     void manager.runOperation('extension-fails', async () => {
       await new Promise(() => { });
+    }).catch((error) => {
+      if (error instanceof LockExtensionError || error instanceof MutexAbortedError) {
+        return;
+      }
+      unexpectedPendingOperationError = error;
     });
 
     // Two renewals succeed, later renewal attempts fail, and the 200ms lease is
@@ -4076,6 +4091,7 @@ describe('Stress Tests & Client Misuse Protection', () => {
 
     expect(result).toBe('recovered');
     expect(extensionAttempts).toBeGreaterThanOrEqual(3); // At least 2 success + 1 fail
+    expect(unexpectedPendingOperationError).toBeUndefined();
 
     await client.quit();
     await client2.quit();
