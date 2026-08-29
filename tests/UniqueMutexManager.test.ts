@@ -13,9 +13,9 @@ import { describe, expect, it, beforeAll, afterAll } from 'vitest';
 import { UniqueMutexManager } from '../src/UniqueMutexManager';
 import type { MutexRunContext } from '../src/UniqueMutexManager';
 import {
+  DistributedLockError,
   MutexAbortedError,
   MutexDeadlockError,
-  MutexLockedError,
   MutexTimeoutError,
 } from '../src/errors';
 
@@ -2140,22 +2140,73 @@ describeDistributed('UniqueMutexManager (distributed via redis)', () => {
     await startedPromise;
 
     let executed = false;
-    await expect(
-      managerB.runOperation(
-        'rapid',
-        async () => {
-          executed = true;
-          return 'should not run';
-        },
-        { waitIfLocked: false }
-      )
-    ).rejects.toBeInstanceOf(MutexLockedError);
+    const skipped = await managerB.runOperation(
+      'rapid',
+      async () => {
+        executed = true;
+        return 'should not run';
+      },
+      { waitIfLocked: false }
+    );
 
+    expect(skipped).toBeUndefined();
     expect(executed).toBe(false);
 
     await running;
     await managerA.dispose();
     await managerB.dispose();
+  });
+
+  it('waits independently of the Redlock retryCount when no timeout is provided', async () => {
+    const redis = {
+      urls: [redisUrl],
+      settings: { retryCount: 0, retryDelay: 15, retryJitter: 0 },
+    };
+    const managerA = new UniqueMutexManager({ redis });
+    const managerB = new UniqueMutexManager({ redis });
+
+    let blockerStarted!: () => void;
+    const blockerReady = new Promise<void>((resolve) => {
+      blockerStarted = resolve;
+    });
+
+    const blocker = managerA.runOperation('indefinite-distributed-wait', async () => {
+      blockerStarted();
+      await sleep(120);
+      return 'blocker';
+    });
+    await blockerReady;
+
+    await expect(
+      managerB.runOperation('indefinite-distributed-wait', async () => 'waiter')
+    ).resolves.toBe('waiter');
+    await blocker;
+
+    await managerA.dispose();
+    await managerB.dispose();
+  });
+
+  it('does not misclassify Redis quorum failures as ordinary lock contention', async () => {
+    const infrastructureError = Object.assign(new Error('quorum unavailable'), {
+      name: 'ExecutionError',
+      attempts: [
+        Promise.resolve({
+          quorumSize: 1,
+          votesAgainst: new Map([[{}, new Error('connection reset')]]),
+        }),
+      ],
+    });
+    const redlock = {
+      settings: { retryDelay: 1, retryJitter: 0 },
+      acquire: async () => {
+        throw infrastructureError;
+      },
+    } as any;
+    const manager = new UniqueMutexManager({ redlock });
+
+    await expect(
+      manager.runOperation('infra-failure', async () => 'never', { waitIfLocked: false })
+    ).rejects.toBeInstanceOf(DistributedLockError);
   });
 
   it('applies timeouts while waiting on distributed locks', async () => {

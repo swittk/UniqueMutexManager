@@ -8,7 +8,6 @@ import {
   LockExtensionError,
   MutexAbortedError,
   MutexDeadlockError,
-  MutexLockedError,
   MutexTimeoutError,
 } from './errors';
 import { Mutex, MutexState } from './mutex';
@@ -90,10 +89,12 @@ export interface UniqueMutexManagerOptions {
 
 interface DistributedLockHandle {
   release: () => Promise<void>;
-  /** Set to true when lock extension fails */
+  /** Most recent immutable Redlock lease. */
+  currentLock?: RedlockLock;
+  /** Set to true when lock extension fails. */
   extensionFailed: boolean;
   extensionError?: Error;
-  /** Called when extension fails - can be used to abort the operation */
+  /** Called when extension fails - can be used to abort the operation. */
   onExtensionFailure?: (error: Error) => void;
 }
 
@@ -115,6 +116,25 @@ const CONTEXT_TOKEN_SYMBOL = Symbol('unique-mutex-context');
 export interface MutexRunContext {
   readonly id: string;
 }
+
+interface MutexRunOptionsBase {
+  context?: MutexRunContext;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  onAbort?: (abort: (reason?: unknown) => void) => void;
+}
+
+/** Options for the normal queueing mode. */
+export interface MutexWaitOptions extends MutexRunOptionsBase {
+  waitIfLocked?: true;
+}
+
+/** Options for a single non-blocking acquisition attempt. */
+export interface MutexNoWaitOptions extends MutexRunOptionsBase {
+  waitIfLocked: false;
+}
+
+export type MutexRunOptions = MutexWaitOptions | MutexNoWaitOptions;
 
 type MutexRunContextInternal = MutexRunContext & {
   readonly managerId: string;
@@ -317,134 +337,225 @@ export class UniqueMutexManager {
   private async acquireDistributedLock(
     id: string,
     waitIfLocked: boolean,
-    timeoutMs?: number
-  ): Promise<DistributedLockHandle> {
+    abortSignal: AbortSignal
+  ): Promise<DistributedLockHandle | undefined> {
     const redlock = await this.ensureRedlock();
     if (!redlock) {
       return { release: async () => { }, extensionFailed: false };
     }
 
     const resource = `uniquemutex:${id}`;
-    let settings: Partial<RedlockSettings> | undefined;
 
-    if (!waitIfLocked) {
-      settings = { retryCount: 0 };
-    } else if (timeoutMs !== undefined && timeoutMs > 0) {
-      // Redlock v5 uses a nested settings object for its configuration.
-      // We calculate retryCount based on the configured retryDelay to respect the user's timeout.
-      const retryDelay = (redlock as any).settings?.retryDelay || 200;
-      const retryCount = Math.ceil(timeoutMs / retryDelay);
-      settings = { retryCount };
+    const attempt = async (): Promise<DistributedLockHandle | undefined> => {
+      try {
+        // Always make one bounded Redlock attempt. Retrying here ourselves keeps
+        // indefinite waits genuinely indefinite while still making AbortSignal and
+        // timeout cancellation responsive between attempts.
+        const lock = await redlock.acquire([resource], this.lockTTL, { retryCount: 0 });
+        let stopExtension: (() => void) | undefined;
+        const handle: DistributedLockHandle = {
+          release: async () => {
+            stopExtension?.();
+            await handle.currentLock!.release();
+          },
+          extensionFailed: false,
+          currentLock: lock,
+        };
+        stopExtension = this.createLockExtension(id, handle);
+        return handle;
+      } catch (error) {
+        if (await this.isDistributedContention(error)) {
+          return undefined;
+        }
+        throw new DistributedLockError(
+          error instanceof Error ? error.message : 'Failed to acquire distributed lock'
+        );
+      }
+    };
+
+    const firstAttempt = await attempt();
+    if (firstAttempt || !waitIfLocked) {
+      return firstAttempt;
     }
 
-    try {
-      const lock = await redlock.acquire([resource], this.lockTTL, settings);
-      const handle: DistributedLockHandle = {
-        release: async () => {
-          if (timer) {
-            clearInterval(timer);
-          }
-          await lock.release();
-        },
-        extensionFailed: false,
-      };
-      const timer = this.createLockExtension(lock, id, handle);
-      return handle;
-    } catch (error: any) {
-      if (isResourceLockedError(error) || isExecutionError(error)) {
-        if (!waitIfLocked) {
-          throw new MutexLockedError(id, `Distributed mutex with id "${id}" is already locked`);
-        }
-        if (timeoutMs !== undefined && timeoutMs > 0) {
-          throw new MutexTimeoutError(id, timeoutMs);
-        }
-        // Fallback for cases where it's just locked but no specific timeout was hit (e.g. Redlock exhausted its own retries)
-        throw new MutexLockedError(id, `Distributed mutex with id "${id}" is already locked`);
+    while (true) {
+      await this.waitForDistributedRetry(redlock, id, abortSignal);
+      const acquired = await attempt();
+      if (acquired) {
+        return acquired;
       }
-      throw new DistributedLockError(
-        error instanceof Error ? error.message : 'Failed to acquire distributed lock'
-      );
     }
   }
 
+  private async isDistributedContention(error: unknown): Promise<boolean> {
+    if (isResourceLockedError(error)) {
+      return true;
+    }
+    if (!isExecutionError(error)) {
+      return false;
+    }
+
+    const attempts = (error as ExecutionError & { attempts?: Array<Promise<unknown> | unknown> }).attempts;
+    if (!Array.isArray(attempts) || attempts.length === 0) {
+      return false;
+    }
+
+    try {
+      const stats = (await attempts[attempts.length - 1]) as {
+        quorumSize?: number;
+        votesAgainst?: Map<unknown, unknown>;
+      };
+      if (!stats?.quorumSize || !(stats.votesAgainst instanceof Map)) {
+        return false;
+      }
+
+      let lockedVotes = 0;
+      for (const vote of stats.votesAgainst.values()) {
+        if (isResourceLockedError(vote)) {
+          lockedVotes += 1;
+        }
+      }
+      return lockedVotes >= stats.quorumSize;
+    } catch {
+      return false;
+    }
+  }
+
+  private async waitForDistributedRetry(
+    redlock: Redlock,
+    id: string,
+    abortSignal: AbortSignal
+  ): Promise<void> {
+    if (abortSignal.aborted) {
+      this.throwDistributedWaitAbort(id, abortSignal.reason);
+    }
+
+    const settings = (redlock as unknown as {
+      settings?: { retryDelay?: number; retryJitter?: number };
+    }).settings;
+    const retryDelay = Math.max(0, settings?.retryDelay ?? 200);
+    const retryJitter = Math.max(0, settings?.retryJitter ?? 100);
+    const jitter = retryJitter > 0
+      ? Math.floor((Math.random() * 2 - 1) * retryJitter)
+      : 0;
+    const delay = Math.max(0, retryDelay + jitter);
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        abortSignal.removeEventListener('abort', onAbort);
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const onAbort = () => {
+        try {
+          this.throwDistributedWaitAbort(id, abortSignal.reason);
+        } catch (error) {
+          finish(error as Error);
+        }
+      };
+      const timer = setTimeout(() => finish(), delay);
+      timer.unref?.();
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+      if (abortSignal.aborted) {
+        onAbort();
+      }
+    });
+  }
+
+  private throwDistributedWaitAbort(id: string, reason: unknown): never {
+    if (reason instanceof MutexTimeoutError) {
+      throw reason;
+    }
+    throw new MutexAbortedError(id, reason);
+  }
+
   private createLockExtension(
-    lock: RedlockLock,
     id: string,
     handle: DistributedLockHandle
-  ): ReturnType<typeof setInterval> | undefined {
-    if (!this.redlock) {
+  ): (() => void) | undefined {
+    if (!this.redlock || this.lockExtendInterval <= 0) {
       return undefined;
     }
 
-    if (this.lockExtendInterval <= 0) {
-      return undefined;
-    }
-
-    // Allow up to 3 consecutive extension failures before aborting
-    // This handles transient network issues while still detecting lock loss
     const maxConsecutiveFailures = 3;
     let consecutiveFailures = 0;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-    // Track the current lock instance. In Redlock v5, Lock objects are immutable
-    // and .extend() returns a new instance. We must use the latest instance
-    // for subsequent extensions and expiration checks.
-    let currentLock = lock;
-    const interval = setInterval(async () => {
-      const now = Date.now();
-      // STRICT CHECK 1: If lock has already expired, we must abort immediately
-      if (now >= currentLock.expiration) {
-        handle.extensionFailed = true;
-        const expiryError = new LockExtensionError(id,
-          `Lock for mutex "${id}" has expired (local time > expiration). Aborting immediately to prevent overlap.`
-        );
-        handle.extensionError = expiryError;
-        if (handle.onExtensionFailure) {
-          try { handle.onExtensionFailure(expiryError); } catch { }
+    const fail = (error: Error) => {
+      handle.extensionFailed = true;
+      handle.extensionError = error;
+      if (handle.onExtensionFailure) {
+        try {
+          handle.onExtensionFailure(error);
+        } catch {
+          // Ignore consumer callback failures.
         }
-        clearInterval(interval);
+      }
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+
+    const schedule = () => {
+      if (stopped) {
+        return;
+      }
+      timer = setTimeout(runExtension, this.lockExtendInterval);
+      timer.unref?.();
+    };
+
+    const runExtension = async () => {
+      if (stopped || !handle.currentLock) {
+        return;
+      }
+
+      const currentLock = handle.currentLock;
+      if (Date.now() >= currentLock.expiration) {
+        fail(new LockExtensionError(
+          id,
+          `Lock for mutex "${id}" has expired. Mutual exclusion can no longer be guaranteed.`
+        ));
         return;
       }
 
       try {
-        // Use currentLock.extend to ensure we are extending the most recent version of the lock
-        const extendedLock = await currentLock.extend(this.lockTTL);
-        if (extendedLock) {
-          currentLock = extendedLock;
-        }
-        consecutiveFailures = 0; // Reset on success
+        handle.currentLock = await currentLock.extend(this.lockTTL);
+        consecutiveFailures = 0;
       } catch (error) {
-        consecutiveFailures++;
-
-        const currentNow = Date.now();
-        // STRICT CHECK 2: Even if we have retries left, if we are now expired, we must abort.
-        if (currentNow >= currentLock.expiration) {
-          consecutiveFailures = maxConsecutiveFailures + 1; // Force failure logic below
-        }
-
-        // Only abort after multiple consecutive failures OR if we expired
-        if (consecutiveFailures >= maxConsecutiveFailures) {
-          // Mark the handle as failed - operation should abort
-          handle.extensionFailed = true;
-          const extensionError = new LockExtensionError(id,
-            `Lock extension failed ${consecutiveFailures} times for mutex "${id}": ${error instanceof Error ? error.message : 'unknown error'}`
-          );
-          handle.extensionError = extensionError;
-          // Call the failure callback if registered
-          if (handle.onExtensionFailure) {
-            try {
-              handle.onExtensionFailure(extensionError);
-            } catch {
-              // Ignore callback errors
-            }
-          }
-          // Stop trying to extend
-          clearInterval(interval);
+        consecutiveFailures += 1;
+        const expired = Date.now() >= currentLock.expiration;
+        if (expired || consecutiveFailures >= maxConsecutiveFailures) {
+          fail(new LockExtensionError(
+            id,
+            `Lock extension failed ${consecutiveFailures} time(s) for mutex "${id}": ${error instanceof Error ? error.message : 'unknown error'}`
+          ));
+          return;
         }
       }
-    }, this.lockExtendInterval);
 
-    interval.unref?.();
-    return interval;
+      schedule();
+    };
+
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
   }
 
   private allocateContext(): OperationContext {
@@ -483,17 +594,26 @@ export class UniqueMutexManager {
     return this.tokenContexts.get(internal);
   }
 
+  runOperation<T>(
+    id: string,
+    operation: OperationType<T>,
+    opts: MutexNoWaitOptions
+  ): Promise<T | undefined>;
+  runOperation<T>(
+    id: string,
+    operation: OperationType<T>,
+    opts?: MutexWaitOptions
+  ): Promise<T>;
+  runOperation<T>(
+    id: string,
+    operation: OperationType<T>,
+    opts: MutexRunOptions
+  ): Promise<T | undefined>;
   async runOperation<T>(
     id: string,
     operation: OperationType<T>,
-    opts?: {
-      waitIfLocked?: boolean;
-      context?: MutexRunContext;
-      timeoutMs?: number;
-      signal?: AbortSignal;
-      onAbort?: (abort: (reason?: unknown) => void) => void;
-    }
-  ): Promise<T> {
+    opts?: MutexRunOptions
+  ): Promise<T | undefined> {
     // Input validation - fail fast for client misuse
     if (!id || typeof id !== 'string' || id.trim().length === 0) {
       throw new Error(`Invalid mutex ID: "${id}". ID must be a non-empty string.`);
@@ -771,13 +891,12 @@ export class UniqueMutexManager {
               throw new MutexAbortedError(id, abortSignal.reason);
             }
 
-            try {
-              distributedLock = await this.acquireDistributedLock(id, canWait, timeoutMs);
-            } catch (error) {
-              if (timeoutError && error instanceof MutexLockedError) {
+            distributedLock = await this.acquireDistributedLock(id, canWait, abortSignal);
+            if (!distributedLock) {
+              if (timeoutError) {
                 throw timeoutError;
               }
-              throw error;
+              return undefined as unknown as T;
             }
 
             if (timeoutError && timedOut) {
